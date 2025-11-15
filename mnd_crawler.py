@@ -75,16 +75,26 @@ def extract_clean_paragraph(html):
     soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text(" ", strip=True)
 
-    start = text.find("中共解放軍臺海周邊海、空域動態")
-    end = text.find("國軍運用任務機、艦及岸置飛彈系統嚴密監控與應處。")
+    prefix = "中共解放軍臺海周邊海、空域動態"
+    end_marker = "國軍運用任務機、艦及岸置飛彈系統嚴密監控與應處。"
+
+    start = text.find(prefix)
+    end = text.find(end_marker)
 
     if start != -1 and end != -1:
-        return text[start:end + len("國軍運用任務機、艦及岸置飛彈系統嚴密監控與應處。")]
+        segment = text[start:end + len(end_marker)]
     elif start != -1:
-        return text[start:]
+        segment = text[start:]
     else:
-        return text
+        segment = text
 
+    # 🔧 處理「標題重複」的情況：
+    # 如果開頭長成「中共解放軍臺海周邊海、空域動態 中共解放軍臺海周邊海、空域動態…」
+    double_prefix = prefix + " " + prefix
+    if segment.startswith(double_prefix):
+        segment = prefix + segment[len(double_prefix):]
+
+    return segment
 def crawl_all():
     session = requests.Session()
     page = 1
