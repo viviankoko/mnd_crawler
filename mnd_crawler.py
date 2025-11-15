@@ -85,38 +85,30 @@ def extract_clean_paragraph(html):
     else:
         return text
 
-def crawl_all():
+def crawl_all(max_pages=None):
     session = requests.Session()
     page = 1
     records = []
-    
-     while True:
 
-        # 👉 這裡是測試模式，只跑 max_pages 的頁數
+    while True:
+
+        # 測試模式：只跑指定頁數
         if max_pages is not None and page > max_pages:
             break
 
-    while True:
-        url = f"{BASE_URL}&Page={page}"
-        print(f"\n抓取第 {page} 頁: {url}")
-        r = session.get(url, headers=HEADERS, timeout=20)
-        if r.status_code != 200:
-            print("無法連線，停止。")
-            break
+        print(f"\n抓取第 {page} 頁: {BASE_URL}&Page={page}")
+        html = session.get(f"{BASE_URL}&Page={page}", timeout=10).text
 
-        items = parse_list_page(r.text)
+        items = parse_list_page(html)
         if not items:
             print("沒有更多資料，結束。")
             break
 
-        for i, it in enumerate(items, 1):
-            print(f"({i}/{len(items)}) 抓取 {it['date']}")
-            try:
-                html_detail = fetch_detail(session, it["view"], it["target"])
-                clean_text = extract_clean_paragraph(html_detail)
-            except Exception as e:
-                print("內頁錯誤:", e)
-                clean_text = ""
+        for idx, it in enumerate(items, start=1):
+            print(f"({idx}/{len(items)}) 抓取 {it['date']}")
+            detail_html = fetch_detail(session, it["eventtarget"], it["eventargument"])
+            clean_text = extract_clean_paragraph(detail_html)
+
             metrics = extract_metrics(clean_text)
 
             record = {
@@ -126,12 +118,12 @@ def crawl_all():
             }
 
             records.append(record)
-            time.sleep(0.8)
 
         page += 1
-        time.sleep(1.5)
 
     df = pd.DataFrame(records)
+    print(f"\n全部完成！共抓取 {len(df)} 筆資料。")
+    print(df.head())
     return df
 
 if __name__ == "__main__":
