@@ -23,3 +23,9 @@ jobs:
 
       - name: Run crawler (A part)
         run: python mnd_crawler.py
+        
+- name: Upload CSV
+  uses: actions/upload-artifact@v3
+  with:
+    name: pla_daily
+    path: pla_daily_clean_full.csv
