@@ -133,3 +133,4 @@ if __name__ == "__main__":
     df.to_csv("pla_daily_clean_full.csv", index=False, encoding="utf-8-sig")
     print("\n全部完成！共抓取", len(df), "筆資料。")
     print(df.head(5))
+git push -u origin main
