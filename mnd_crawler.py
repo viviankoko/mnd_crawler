@@ -90,6 +90,11 @@ def crawl_all():
     page = 1
     records = []
 
+     while True:
+        # 👉 測試模式：如果有設定 max_pages，就只跑到那頁
+        if max_pages is not None and page > max_pages:
+            break
+
     while True:
         url = f"{BASE_URL}&Page={page}"
         print(f"\n抓取第 {page} 頁: {url}")
@@ -129,7 +134,12 @@ def crawl_all():
     return df
 
 if __name__ == "__main__":
-    df = crawl_all()
-    df.to_csv("pla_daily_clean_full.csv", index=False, encoding="utf-8-sig")
-    print("\n全部完成！共抓取", len(df), "筆資料。")
-    print(df.head(5))
+
+    df = crawl_all(max_pages=1)
+
+    print("\n=== 第一筆的通報內容（用來檢查乾淨文本） ===")
+    print(df.loc[0, "通報內容"])  # 這行就是你要看的乾淨文本
+    #
+    #df = crawl_all()
+    ##print("\n全部完成！共抓取", len(df), "筆資料。")
+    #print(df.head(5))
