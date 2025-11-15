@@ -89,11 +89,10 @@ def crawl_all():
     session = requests.Session()
     page = 1
     records = []
-
-     while True:
+    while True:
         # 👉 測試模式：如果有設定 max_pages，就只跑到那頁
-        if max_pages is not None and page > max_pages:
-            break
+    if max_pages is not None and page > max_pages:
+        break
 
     while True:
         url = f"{BASE_URL}&Page={page}"
