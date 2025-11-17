@@ -8,6 +8,8 @@ on:
 jobs:
   crawl:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write   #讓 Actions 可以 push
 
     steps:
       - name: Checkout repo
