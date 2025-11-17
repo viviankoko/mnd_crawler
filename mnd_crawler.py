@@ -8,10 +8,18 @@ Original file is located at
 """
 
 def extract_metrics(text):
+    m_air = re.search(r"(共|計)\s*(\d+)\s*架次", text)
+    aircraft_total = int(m_air.group(2)) if m_air else None
+
+    m_adiz = re.search(r"其中\s*(\d+)\s*架次.*?(ADIZ|空域|中線)", text)
+    adiz_count = int(m_adiz.group(1)) if m_adiz else None
+
+    m_ship = re.search(r"(共|計)\s*(\d+)\s*艦", text)
+    ship_count = int(m_ship.group(2)) if m_ship else None
     return {
-        "偵測到的共機總數": None,
-        "進入ADIZ或跨越中線": None,
-        "偵測到的共艦數量": None
+        "偵測到的共機總數": aircraft_total,
+        "進入ADIZ或跨越中線": adiz_count,
+        "共艦活動數量": ship_count,
     }
 
 # -*- coding: utf-8 -*-
