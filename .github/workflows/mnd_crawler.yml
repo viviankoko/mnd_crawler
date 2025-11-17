@@ -2,6 +2,8 @@ name: MND Crawler A
 
 on:
   workflow_dispatch:  # 手動觸發
+  schedule:
+    - cron: "0 6 * * *"
 
 jobs:
   crawl:
@@ -29,4 +31,23 @@ jobs:
         with:
           name: pla_daily
           path: pla_daily_clean_full.csv
+          
+      - name: Upload final CSV
+        uses: actions/upload-artifact@v4
+        with:
+          name: pla_daily_final
+          path: pla_daily_clean_full.csv
 
+      - name: Commit and push updated CSV (if changed)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "action@github.com"
+
+          git add pla_daily_clean_full.csv || true
+
+          if [ -n "$(git status --porcelain)" ]; then
+            git commit -m "Auto update PLA daily data"
+            git push
+          else
+            echo "No changes to commit"
+          fi
