@@ -51,13 +51,29 @@ def parse_list_page(html):
     soup = BeautifulSoup(html, "html.parser")
     fields = parse_viewstate_fields(soup)
     items = []
+
+    # 所有你要抓的標題關鍵字（之後有新的可以再加）
+    KEYWORDS = [
+        "中共解放軍臺海周邊海、空域動態",       # 新格式主標
+        "中共解放軍軍機",                         # 軍機進入我西南防空識別區內飛航
+        "中共解放軍進入我西南空域活動情況",       # 進入我西南空域活動情況
+        "踰越海峽中線及進入我西南空域活動情況",
+        "逾越海峽中線及進入我西南空域活動情況",
+        "我西南空域空情動態",                     # 110/02/xx 那串
+        "臺海周邊空域空情動態",                   # 8月xx日臺海周邊空域空情動態新聞稿
+        "偵獲共機、艦在臺海周邊活動情形",         # 國防部發布新聞稿說明今日偵獲共機、艦…
+    ]
+
     for tr in soup.select("table tr"):
         a = tr.find("a", href=True)
         if not a:
             continue
         title = a.get_text(strip=True)
-        if "中共解放軍臺海周邊海、空域動態" not in title:
+
+        # 標題只要含任一關鍵字就留下
+        if not any(kw in title for kw in KEYWORDS):
             continue
+
         target = extract_postback_target(a)
         date_text = None
         for td in tr.find_all("td"):
@@ -83,26 +99,77 @@ def extract_clean_paragraph(html):
     soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text(" ", strip=True)
 
-    prefix = "中共解放軍臺海周邊海、空域動態"
-    end_marker = "國軍運用任務機、艦及岸置飛彈系統嚴密監控與應處。"
+    prefix_new = "中共解放軍臺海周邊海、空域動態"
+    end_new = "國軍運用任務機、艦及岸置飛彈系統嚴密監控與應處。"
+    prefix_old = "中共解放軍軍機"
 
-    start = text.find(prefix)
-    end = text.find(end_marker)
+    # 小工具：如果開頭是「標題 標題 …」，只留一個標題
+    def dedup_prefix(segment: str) -> str:
+        double = prefix_new + " " + prefix_new
+        if segment.startswith(double):
+            return prefix_new + segment[len(double):]
+        return segment
 
-    if start != -1 and end != -1:
-        segment = text[start:end + len(end_marker)]
-    elif start != -1:
-        segment = text[start:]
-    else:
-        segment = text
+    # -------------------------
+    # 格式 1-1：標準新格式（有標題＋結尾句）
+    # -------------------------
+    if prefix_new in text and end_new in text:
+        start = text.find(prefix_new)
+        end = text.find(end_new, start)
+        segment = text[start:end + len(end_new)]
+        return dedup_prefix(segment)
 
-    # 🔧 處理「標題重複」的情況：
-    # 如果開頭長成「中共解放軍臺海周邊海、空域動態 中共解放軍臺海周邊海、空域動態…」
-    double_prefix = prefix + " " + prefix
-    if segment.startswith(double_prefix):
-        segment = prefix + segment[len(double_prefix):]
+    # -------------------------
+    # 格式 1-2：新聞稿格式（國防部今…＋結尾句）
+    # 例如：8月19日臺海周邊空域空情動態新聞稿、
+    #      偵獲共機、艦在臺海周邊活動情形
+    # -------------------------
+    if "國防部今" in text and end_new in text:
+        start = text.find("國防部今")
+        end = text.find(end_new, start)
+        if end != -1:
+            segment = text[start:end + len(end_new)]
+        else:
+            segment = text[start:]
+        # 這類通常不會有「標題 標題」，不用 dedup
+        return segment.strip()
 
-    return segment
+    # -------------------------
+    # 格式 3：無活動格式（未偵獲共機、艦）
+    # 例如最近 114/11/12、114/11/13
+    # -------------------------
+    if prefix_new in text and "未偵獲共機" in text:
+        start = text.find(prefix_new)
+        end = text.find("下載專區", start)
+        if end == -1:
+            end = len(text)
+        segment = text[start:end]
+        return dedup_prefix(segment.strip())
+
+    # -------------------------
+    # 格式 2：舊格式（軍機進入西南 ADIZ）
+    # 例：109/10/01 那批
+    # -------------------------
+    if prefix_old in text:
+        start = text.find(prefix_old)
+
+        date_start = text.find("一、日期", start)
+        type_start = text.find("二、機型", date_start)
+
+        next_section = text.find("三、", type_start)
+        if next_section == -1:
+            next_section = text.find("下載專區", type_start)
+        if next_section == -1:
+            next_section = len(text)
+
+        segment = text[start:next_section]
+        return segment.strip()
+
+    # -------------------------
+    # 無法辨識的格式 → 放棄（回傳 None）
+    # -------------------------
+    return None
+
 def crawl_all():
     session = requests.Session()
     page = 1
@@ -129,12 +196,10 @@ def crawl_all():
             except Exception as e:
                 print("內頁錯誤:", e)
                 clean_text = ""
-            metrics = extract_metrics(clean_text)
 
             record = {
                 "日期": it["date"],
                 "通報內容": clean_text,
-                **metrics
             }
 
             records.append(record)
