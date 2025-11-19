@@ -58,6 +58,7 @@ def parse_list_page(html):
         "偵獲共機、艦在臺海周邊活動情形",
     ]
 
+
     for tr in soup.select("table tr"):
         a = tr.find("a", href=True)
         if not a:
@@ -97,57 +98,63 @@ def extract_clean_paragraph(html):
     soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text(" ", strip=True)
 
-    prefix_new = "中共解放軍臺海周邊海、空域動態"
-    end_new = "國軍運用任務機、艦及岸置飛彈系統嚴密監控與應處。"
-    prefix_old = "中共解放軍軍機"
+    PREFIXES = [
+        "中共解放軍臺海周邊海、空域動態",
+        "中共解放軍軍機",
+        "中共解放軍進入我西南空域活動情況",
+        "踰越海峽中線及進入我西南空域活動情況",
+        "逾越海峽中線及進入我西南空域活動情況",
+        "我西南空域空情動態",
+        "臺海周邊空域空情動態",
+        "偵獲共機、艦在臺海周邊活動情形",
+    ]
 
-    def dedup_prefix(segment: str) -> str:
-        double = prefix_new + " " + prefix_new
+    # 🔹 1. 找起點：哪一個標題最早出現
+    start = -1
+    used_prefix = None
+    for p in PREFIXES:
+        idx = text.find(p)
+        if idx != -1 and (start == -1 or idx < start):
+            start = idx
+            used_prefix = p
+
+    if start == -1:
+        # 這頁根本不是我們要的格式
+        return None
+
+    # 🔹 2. 找多種可能的「結尾」
+    END_PHRASES = [
+        "國軍運用任務機、艦及岸置飛彈系統嚴密監控與應處。",
+        "國軍運用任務機、艦及岸置飛彈系統嚴密監控與應處",
+        "下載專區",
+    ]
+
+    end_candidates = []
+
+    for phrase in END_PHRASES:
+        pos = text.find(phrase, start)
+        if pos != -1:
+            # 「嚴密監控與應處」要切在句子後面，「下載專區」就切在它前面即可
+            if "嚴密監控與應處" in phrase:
+                end_candidates.append(pos + len(phrase))
+            else:
+                end_candidates.append(pos)
+
+    if end_candidates:
+        end = min(end_candidates)  # 取最早出現的結尾
+    else:
+        # 萬一真的沒有任何結尾詞，就切到全文末尾，至少不會是 None
+        end = len(text)
+
+    segment = text[start:end]
+
+    # 🔹 3. 去掉「標題標題」這種重複開頭
+    if used_prefix is not None:
+        double = used_prefix + " " + used_prefix
         if segment.startswith(double):
-            return prefix_new + segment[len(double):]
-        return segment
+            segment = used_prefix + segment[len(double):]
 
-    # 🟦 新格式（含 10/01 特殊格式）
-    if prefix_new in text:
-        start = text.find(prefix_new)
-
-        end = text.find(end_new, start)
-        if end != -1:
-            end += len(end_new)
-        else:
-            end = text.find("下載專區", start)
-            if end == -1:
-                end = len(text)
-
-        return dedup_prefix(text[start:end].strip())
-
-    # 新聞稿格式
-    if "國防部今" in text and end_new in text:
-        start = text.find("國防部今")
-        end = text.find(end_new, start)
-        if end != -1:
-            end += len(end_new)
-        else:
-            end = len(text)
-        return text[start:end].strip()
-
-    # 舊格式（西南空域）
-    if prefix_old in text:
-        start = text.find(prefix_old)
-
-        date_start = text.find("一、日期", start)
-        type_start = text.find("二、機型", date_start)
-
-        next_section = text.find("三、", type_start)
-        if next_section == -1:
-            next_section = text.find("下載專區", type_start)
-        if next_section == -1:
-            next_section = len(text)
-
-        return text[start:next_section].strip()
-
-    return None
-
+    return segment.strip()
 
 def crawl_all():
     session = requests.Session()
