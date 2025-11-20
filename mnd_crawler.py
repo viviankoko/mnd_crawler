@@ -8,6 +8,9 @@ import time
 BASE_URL = "https://www.mnd.gov.tw/PublishTable.aspx?Types=即時軍事動態&title=國防消息"
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 
+# ---------------------------------------------------------
+# 解析軍機/軍艦數量（可保留，不影響你目前只產出日期＋全文）
+# ---------------------------------------------------------
 def extract_metrics(text):
     m_air = re.search(r"(共|計)\s*(\d+)\s*架次", text)
     aircraft_total = int(m_air.group(2)) if m_air else None
@@ -25,6 +28,9 @@ def extract_metrics(text):
     }
 
 
+# ---------------------------------------------------------
+# ASP.NET ViewState
+# ---------------------------------------------------------
 def parse_viewstate_fields(soup):
     def val(name):
         el = soup.find("input", {"name": name})
@@ -42,6 +48,9 @@ def extract_postback_target(a_tag):
     return m.group(1) if m else None
 
 
+# ---------------------------------------------------------
+# 列表頁：抓日期與 postback TARGET
+# ---------------------------------------------------------
 def parse_list_page(html):
     soup = BeautifulSoup(html, "html.parser")
     fields = parse_viewstate_fields(soup)
@@ -58,7 +67,6 @@ def parse_list_page(html):
         "偵獲共機、艦在臺海周邊活動情形",
     ]
 
-
     for tr in soup.select("table tr"):
         a = tr.find("a", href=True)
         if not a:
@@ -69,8 +77,8 @@ def parse_list_page(html):
             continue
 
         target = extract_postback_target(a)
-        date_text = None
 
+        date_text = None
         for td in tr.find_all("td"):
             if re.search(r"\d{3}/\d{1,2}/\d{1,2}", td.get_text()):
                 date_text = td.get_text(strip=True)
@@ -81,7 +89,10 @@ def parse_list_page(html):
     return items
 
 
-def fetch_detail(session, view_fields, target):
+# ---------------------------------------------------------
+# 內頁請求（加 retry）
+# ---------------------------------------------------------
+def fetch_detail(session, view_fields, target, retries=2):
     data = {
         "__EVENTTARGET": target,
         "__EVENTARGUMENT": "",
@@ -89,11 +100,23 @@ def fetch_detail(session, view_fields, target):
         "__VIEWSTATEGENERATOR": view_fields["__VIEWSTATEGENERATOR"],
         "__EVENTVALIDATION": view_fields["__EVENTVALIDATION"],
     }
-    r = session.post(BASE_URL, headers=HEADERS, data=data, timeout=20)
-    r.raise_for_status()
-    return r.text
+
+    for attempt in range(retries):
+        try:
+            r = session.post(BASE_URL, headers=HEADERS, data=data, timeout=40)
+            r.raise_for_status()
+            return r.text
+        except requests.exceptions.ReadTimeout:
+            print(f"內頁逾時（第 {attempt+1} 次），重試中…")
+            time.sleep(2)
+
+    print("內頁讀取失敗，略過此筆資料。")
+    return ""
 
 
+# ---------------------------------------------------------
+# 萃取公告全文（不重複標題＋支援所有結尾）
+# ---------------------------------------------------------
 def extract_clean_paragraph(html):
     soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text(" ", strip=True)
@@ -109,53 +132,52 @@ def extract_clean_paragraph(html):
         "偵獲共機、艦在臺海周邊活動情形",
     ]
 
-    # 🔹 1. 找起點：哪一個標題最早出現
+    # 找最早出現的 prefix
     start = -1
     used_prefix = None
     for p in PREFIXES:
-        idx = text.find(p)
-        if idx != -1 and (start == -1 or idx < start):
-            start = idx
+        pos = text.find(p)
+        if pos != -1 and (start == -1 or pos < start):
+            start = pos
             used_prefix = p
 
     if start == -1:
-        # 這頁根本不是我們要的格式
         return None
 
-    # 🔹 2. 找多種可能的「結尾」
     END_PHRASES = [
+        "下載專區",
         "國軍運用任務機、艦及岸置飛彈系統嚴密監控與應處。",
         "國軍運用任務機、艦及岸置飛彈系統嚴密監控與應處",
-        "下載專區",
     ]
 
     end_candidates = []
-
     for phrase in END_PHRASES:
         pos = text.find(phrase, start)
         if pos != -1:
-            # 「嚴密監控與應處」要切在句子後面，「下載專區」就切在它前面即可
-            if "嚴密監控與應處" in phrase:
+            if "應處" in phrase:
                 end_candidates.append(pos + len(phrase))
             else:
                 end_candidates.append(pos)
 
     if end_candidates:
-        end = min(end_candidates)  # 取最早出現的結尾
+        end = min(end_candidates)
     else:
-        # 萬一真的沒有任何結尾詞，就切到全文末尾，至少不會是 None
         end = len(text)
 
     segment = text[start:end]
 
-    # 🔹 3. 去掉「標題標題」這種重複開頭
-    if used_prefix is not None:
-        double = used_prefix + " " + used_prefix
-        if segment.startswith(double):
-            segment = used_prefix + segment[len(double):]
+    # 去掉標題重複
+    if used_prefix:
+        dup = used_prefix + " " + used_prefix
+        if segment.startswith(dup):
+            segment = used_prefix + segment[len(dup):]
 
     return segment.strip()
 
+
+# ---------------------------------------------------------
+# 爬全部資料（正式版本）
+# ---------------------------------------------------------
 def crawl_all():
     session = requests.Session()
     page = 1
@@ -165,25 +187,28 @@ def crawl_all():
         url = f"{BASE_URL}&Page={page}"
         print(f"\n抓取第 {page} 頁: {url}")
 
-        r = session.get(url, headers=HEADERS, timeout=20)
+        # 列表頁 retry
+        try:
+            r = session.get(url, headers=HEADERS, timeout=40)
+        except requests.exceptions.ReadTimeout:
+            print(f"第 {page} 頁逾時，再試一次…")
+            time.sleep(2)
+            continue
+
         if r.status_code != 200:
-            print("無法連線，停止。")
+            print("無法連線")
             break
 
         items = parse_list_page(r.text)
         if not items:
-            print("沒有更多資料，結束。")
+            print("已無更多資料。")
             break
 
-        for i, it in enumerate(items, 1):
-            print(f"({i}/{len(items)}) 抓取 {it['date']}")
+        for it in items:
+            print(f"➡ 抓取 {it['date']}")
 
-            try:
-                html_detail = fetch_detail(session, it["view"], it["target"])
-                clean_text = extract_clean_paragraph(html_detail)
-            except Exception as e:
-                print("內頁錯誤:", e)
-                clean_text = ""
+            html_detail = fetch_detail(session, it["view"], it["target"])
+            clean_text = extract_clean_paragraph(html_detail)
 
             records.append({
                 "日期": it["date"],
@@ -198,8 +223,48 @@ def crawl_all():
     return pd.DataFrame(records)
 
 
+# ---------------------------------------------------------
+# Debug：只抓某一天
+# ---------------------------------------------------------
+def debug_one_day(DEBUG_DATE):
+    session = requests.Session()
+    page = 1
+
+    while True:
+        url = f"{BASE_URL}&Page={page}"
+        print(f"查頁 {page} … {url}")
+
+        try:
+            r = session.get(url, headers=HEADERS, timeout=40)
+        except requests.exceptions.ReadTimeout:
+            print(f"第 {page} 頁逾時，再試一次…")
+            time.sleep(2)
+            continue
+
+        items = parse_list_page(r.text)
+        if not items:
+            print("找不到這一天。")
+            return
+
+        for it in items:
+            if it["date"] == DEBUG_DATE:
+                print(f"\n🎯 找到日期：{DEBUG_DATE}")
+                html_detail = fetch_detail(session, it["view"], it["target"])
+                clean_text = extract_clean_paragraph(html_detail)
+
+                print("\n=== HTML detail (前 1200 字) ===")
+                print(html_detail[:1200])
+                print("\n=== clean_text ===")
+                print(clean_text)
+                return
+
+        page += 1
+
+
+# ---------------------------------------------------------
+# main
+# ---------------------------------------------------------
 if __name__ == "__main__":
     df = crawl_all()
     df.to_csv("pla_daily_clean_full.csv", index=False, encoding="utf-8-sig")
-    print("\n全部完成！共抓取", len(df), "筆資料。")
-    print(df.head(5))
+    print("\n全部完成！筆數 =", len(df))
