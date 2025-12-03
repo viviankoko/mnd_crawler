@@ -1,18 +1,17 @@
-name: MND Crawler A
+name: Auto update PLA daily data
 
 on:
-  workflow_dispatch:  # 手動觸發
   schedule:
-    - cron: "0 6 * * *"
+    # 每天台灣時間 14:00 執行（台灣 +8，換算 UTC 06:00）
+    - cron: '0 6 * * *'
+  workflow_dispatch:  # 也可以在 Actions 頁面手動按下執行
 
 jobs:
   crawl:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write   #讓 Actions 可以 push
 
     steps:
-      - name: Checkout repo
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -25,25 +24,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run crawler (A part)
-        run: python mnd_crawler.py   # 這步一定要有，才會產生 CSV
-          
-      - name: Upload final CSV
-        uses: actions/upload-artifact@v4
-        with:
-          name: pla_daily_final
-          path: pla_daily_clean_full.csv
-
-      - name: Commit and push updated CSV (if changed)
+      - name: Run crawler
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "action@github.com"
+          python mnd_crawler.py
 
-          git add pla_daily_clean_full.csv || true
-
-          if [ -n "$(git status --porcelain)" ]; then
-            git commit -m "Auto update PLA daily data"
-            git push
-          else
-            echo "No changes to commit"
-          fi
+      - name: Commit and push updated CSV
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "Auto update PLA daily data"
+          # 會自動 commit 這兩個檔案
+          file_pattern: |
+            pla_daily_latest.csv
+            pla_daily_clean_full.csv
