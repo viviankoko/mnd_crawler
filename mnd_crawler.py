@@ -1,270 +1,190 @@
-# -*- coding: utf-8 -*-
 import requests
 from bs4 import BeautifulSoup
+from urllib.parse import urljoin
+from pathlib import Path
 import re
 import pandas as pd
-import time
 
-BASE_URL = "https://www.mnd.gov.tw/PublishTable.aspx?Types=即時軍事動態&title=國防消息"
-HEADERS = {"User-Agent": "Mozilla/5.0"}
+BASE_URL = "https://www.mnd.gov.tw"
+LIST_BASE = f"{BASE_URL}/news/plaactlist"
 
-# ---------------------------------------------------------
-# 解析軍機/軍艦數量（可保留，不影響你目前只產出日期＋全文）
-# ---------------------------------------------------------
-def extract_metrics(text):
-    m_air = re.search(r"(共|計)\s*(\d+)\s*架次", text)
-    aircraft_total = int(m_air.group(2)) if m_air else None
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X)"
+}
 
-    m_adiz = re.search(r"其中\s*(\d+)\s*架次.*?(ADIZ|空域|中線)", text)
-    adiz_count = int(m_adiz.group(1)) if m_adiz else None
+BASE_DIR = Path(__file__).parent
 
-    m_ship = re.search(r"(共|計)\s*(\d+)\s*艦", text)
-    ship_count = int(m_ship.group(2)) if m_ship else None
-
-    return {
-        "偵測到的共機總數": aircraft_total,
-        "進入ADIZ或跨越中線": adiz_count,
-        "共艦活動數量": ship_count,
-    }
+# 路徑（都放在 repo 根目錄）
+MANUAL_CSV = BASE_DIR / "manual_gap.csv"          # 你手動補的缺口資料
+LATEST_CSV = BASE_DIR / "pla_daily_latest.csv"    # 這次爬到的所有資料
+FINAL_CSV = BASE_DIR / "pla_daily_clean_full.csv" # 合併後最終檔案
 
 
-# ---------------------------------------------------------
-# ASP.NET ViewState
-# ---------------------------------------------------------
-def parse_viewstate_fields(soup):
-    def val(name):
-        el = soup.find("input", {"name": name})
-        return el["value"] if el and el.has_attr("value") else ""
-    return {
-        "__VIEWSTATE": val("__VIEWSTATE"),
-        "__VIEWSTATEGENERATOR": val("__VIEWSTATEGENERATOR"),
-        "__EVENTVALIDATION": val("__EVENTVALIDATION"),
-    }
+def build_list_url(page: int) -> str:
+    """page=1: /plaactlist, page>=2: /plaactlist/2"""
+    return LIST_BASE if page == 1 else f"{LIST_BASE}/{page}"
 
 
-def extract_postback_target(a_tag):
-    href = a_tag.get("href", "")
-    m = re.search(r"__doPostBack\('([^']+)'", href)
-    return m.group(1) if m else None
+def crawl_list_page(page: int):
+    """
+    抓某一頁列表，只留「中共解放軍臺海周邊海、空域動態」
+    回傳 list[dict]: {roc_date, url}
+    roc_date 例如 '114.12.01'
+    """
+    url = build_list_url(page)
+    print(f"\n🔍 抓列表頁：{url}")
 
+    r = requests.get(url, headers=HEADERS, timeout=20)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
 
-# ---------------------------------------------------------
-# 列表頁：抓日期與 postback TARGET
-# ---------------------------------------------------------
-def parse_list_page(html):
-    soup = BeautifulSoup(html, "html.parser")
-    fields = parse_viewstate_fields(soup)
-    items = []
+    rows = []
 
-    KEYWORDS = [
-        "中共解放軍臺海周邊海、空域動態",
-        "中共解放軍軍機",
-        "中共解放軍進入我西南空域活動情況",
-        "踰越海峽中線及進入我西南空域活動情況",
-        "逾越海峽中線及進入我西南空域活動情況",
-        "我西南空域空情動態",
-        "臺海周邊空域空情動態",
-        "偵獲共機、艦在臺海周邊活動情形",
-    ]
-
-    for tr in soup.select("table tr"):
-        a = tr.find("a", href=True)
-        if not a:
-            continue
-        title = a.get_text(strip=True)
-
-        if not any(kw in title for kw in KEYWORDS):
+    for a in soup.find_all("a"):
+        text = a.get_text(strip=True)
+        if "中共解放軍臺海周邊海、空域動態" not in text:
             continue
 
-        target = extract_postback_target(a)
+        # 例如：114.12.01中共解放軍臺海周邊海、空域動態點閱次數：413 次
+        m = re.search(r"\d{3}\.\d{2}\.\d{2}", text)
+        if not m:
+            continue
+        roc_date = m.group(0)
 
-        date_text = None
-        for td in tr.find_all("td"):
-            if re.search(r"\d{3}/\d{1,2}/\d{1,2}", td.get_text()):
-                date_text = td.get_text(strip=True)
-                break
+        href = a.get("href")
+        if not href:
+            continue
+        article_url = urljoin(BASE_URL, href)
 
-        items.append({"date": date_text, "target": target, "view": fields})
+        rows.append(
+            {
+                "roc_date": roc_date,
+                "url": article_url,
+            }
+        )
 
-    return items
-
-
-# ---------------------------------------------------------
-# 內頁請求（加 retry）
-# ---------------------------------------------------------
-def fetch_detail(session, view_fields, target, retries=2):
-    data = {
-        "__EVENTTARGET": target,
-        "__EVENTARGUMENT": "",
-        "__VIEWSTATE": view_fields["__VIEWSTATE"],
-        "__VIEWSTATEGENERATOR": view_fields["__VIEWSTATEGENERATOR"],
-        "__EVENTVALIDATION": view_fields["__EVENTVALIDATION"],
-    }
-
-    for attempt in range(retries):
-        try:
-            r = session.post(BASE_URL, headers=HEADERS, data=data, timeout=40)
-            r.raise_for_status()
-            return r.text
-        except requests.exceptions.ReadTimeout:
-            print(f"內頁逾時（第 {attempt+1} 次），重試中…")
-            time.sleep(2)
-
-    print("內頁讀取失敗，略過此筆資料。")
-    return ""
+    print(f"📌 本頁抓到 {len(rows)} 筆")
+    return rows
 
 
-# ---------------------------------------------------------
-# 萃取公告全文（不重複標題＋支援所有結尾）
-# ---------------------------------------------------------
-def extract_clean_paragraph(html):
+def extract_maincontent_text(html: str) -> str:
+    """
+    只取 <div class="maincontent"> 裡面的文字，
+    串成一行：
+    「中共解放軍臺海周邊海、空域動態 一、日期：… 二、活動動態：…」
+    """
     soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text(" ", strip=True)
 
-    PREFIXES = [
-        "中共解放軍臺海周邊海、空域動態",
-        "中共解放軍軍機",
-        "中共解放軍進入我西南空域活動情況",
-        "踰越海峽中線及進入我西南空域活動情況",
-        "逾越海峽中線及進入我西南空域活動情況",
-        "我西南空域空情動態",
-        "臺海周邊空域空情動態",
-        "偵獲共機、艦在臺海周邊活動情形",
-    ]
+    main_div = soup.select_one("div.maincontent")
+    if main_div is None:
+        return ""
 
-    # 找最早出現的 prefix
-    start = -1
-    used_prefix = None
-    for p in PREFIXES:
-        pos = text.find(p)
-        if pos != -1 and (start == -1 or pos < start):
-            start = pos
-            used_prefix = p
+    parts = list(main_div.stripped_strings)
+    text = " ".join(parts)
+    return text
 
-    if start == -1:
-        return None
 
-    END_PHRASES = [
-        "下載專區",
-        "國軍運用任務機、艦及岸置飛彈系統嚴密監控與應處。",
-        "國軍運用任務機、艦及岸置飛彈系統嚴密監控與應處",
-    ]
+def crawl_article_text(url: str) -> str:
+    print(f"➡️ 抓文章頁：{url}")
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=20)
+        r.raise_for_status()
+        r.encoding = r.apparent_encoding
+    except Exception as e:
+        print(f"⚠️ 抓取文章失敗：{url} - {e}")
+        return ""
+    return extract_maincontent_text(r.text)
 
-    end_candidates = []
-    for phrase in END_PHRASES:
-        pos = text.find(phrase, start)
-        if pos != -1:
-            if "應處" in phrase:
-                end_candidates.append(pos + len(phrase))
-            else:
-                end_candidates.append(pos)
 
-    if end_candidates:
-        end = min(end_candidates)
+def roc_to_sort_key(s: str):
+    """
+    把 '114/12/03' 轉成排序用 tuple (114, 12, 3)
+    """
+    try:
+        y, m, d = s.split("/")
+        return int(y), int(m), int(d)
+    except Exception:
+        return (0, 0, 0)
+
+
+def crawl_all_pages(max_pages: int = 200) -> pd.DataFrame:
+    """
+    從第 1 頁一路抓到沒資料或達到 max_pages。
+    回傳欄位：日期, 內容
+    """
+    data_rows = []
+
+    for page in range(1, max_pages + 1):
+        entries = crawl_list_page(page)
+        if not entries:
+            print(f"⚪ 第 {page} 頁沒有資料，停止往後抓。")
+            break
+
+        for entry in entries:
+            text = crawl_article_text(entry["url"])
+            date_str = entry["roc_date"].replace(".", "/")  # 114.12.03 -> 114/12/03
+            data_rows.append(
+                {
+                    "日期": date_str,
+                    "內容": text,
+                }
+            )
+
+    df = pd.DataFrame(data_rows)
+    return df
+
+
+def merge_with_manual(df_new: pd.DataFrame) -> pd.DataFrame:
+    """
+    把這次爬到的 df_new 跟 manual_gap.csv 合併。
+    manual_gap.csv 每列格式：
+    114/11/29,中共解放軍臺海周邊海、空域動態 一、日期：…
+    （沒有欄位名稱）
+    """
+    if MANUAL_CSV.exists():
+        print(f"📥 讀取手動補齊檔案：{MANUAL_CSV}")
+        df_manual = pd.read_csv(MANUAL_CSV, header=None, names=["日期", "內容"])
     else:
-        end = len(text)
+        print("⚠️ 找不到 manual_gap.csv，只使用本次爬到的資料。")
+        df_manual = pd.DataFrame(columns=["日期", "內容"])
 
-    segment = text[start:end]
+    # 個別去重
+    df_manual = df_manual.drop_duplicates(subset=["日期"], keep="first")
+    df_new = df_new.drop_duplicates(subset=["日期"], keep="first")
 
-    # 去掉標題重複
-    if used_prefix:
-        dup = used_prefix + " " + used_prefix
-        if segment.startswith(dup):
-            segment = used_prefix + segment[len(dup):]
+    # 合併：手動補齊在前，新爬資料在後
+    df_all = pd.concat([df_manual, df_new], ignore_index=True)
 
-    return segment.strip()
+    # 以「日期」去重，保留第一次出現（優先 manual）
+    df_all = df_all.drop_duplicates(subset=["日期"], keep="first")
 
+    # 依日期排序（民國年 / 月 / 日）
+    df_all = df_all.sort_values(by="日期", key=lambda col: col.map(roc_to_sort_key))
 
-# ---------------------------------------------------------
-# 爬全部資料（正式版本）
-# ---------------------------------------------------------
-def crawl_all():
-    session = requests.Session()
-    page = 1
-    records = []
-
-    while True:
-        url = f"{BASE_URL}&Page={page}"
-        print(f"\n抓取第 {page} 頁: {url}")
-
-        # 列表頁 retry
-        try:
-            r = session.get(url, headers=HEADERS, timeout=40)
-        except requests.exceptions.ReadTimeout:
-            print(f"第 {page} 頁逾時，再試一次…")
-            time.sleep(2)
-            continue
-
-        if r.status_code != 200:
-            print("無法連線")
-            break
-
-        items = parse_list_page(r.text)
-        if not items:
-            print("已無更多資料。")
-            break
-
-        for it in items:
-            print(f"➡ 抓取 {it['date']}")
-
-            html_detail = fetch_detail(session, it["view"], it["target"])
-            clean_text = extract_clean_paragraph(html_detail)
-
-            records.append({
-                "日期": it["date"],
-                "通報內容": clean_text,
-            })
-
-            time.sleep(0.8)
-
-        page += 1
-        time.sleep(1.5)
-
-    return pd.DataFrame(records)
+    return df_all
 
 
-# ---------------------------------------------------------
-# Debug：只抓某一天
-# ---------------------------------------------------------
-def debug_one_day(DEBUG_DATE):
-    session = requests.Session()
-    page = 1
+def main():
+    print("🚀 開始爬取國防部區域動態…")
 
-    while True:
-        url = f"{BASE_URL}&Page={page}"
-        print(f"查頁 {page} … {url}")
+    df_new = crawl_all_pages()
+    print(f"\n✅ 本次共爬到 {len(df_new)} 筆資料")
 
-        try:
-            r = session.get(url, headers=HEADERS, timeout=40)
-        except requests.exceptions.ReadTimeout:
-            print(f"第 {page} 頁逾時，再試一次…")
-            time.sleep(2)
-            continue
+    if len(df_new) > 0:
+        # 本次爬到的原始資料
+        df_new.to_csv(LATEST_CSV, index=False, header=False, encoding="utf-8-sig")
+        print(f"📝 已寫入最新爬取資料：{LATEST_CSV}")
+    else:
+        print("⚠️ 本次沒有爬到任何資料。仍會嘗試用 manual_gap.csv 產出最終檔。")
 
-        items = parse_list_page(r.text)
-        if not items:
-            print("找不到這一天。")
-            return
+    # 合併手動補齊
+    df_final = merge_with_manual(df_new)
 
-        for it in items:
-            if it["date"] == DEBUG_DATE:
-                print(f"\n🎯 找到日期：{DEBUG_DATE}")
-                html_detail = fetch_detail(session, it["view"], it["target"])
-                clean_text = extract_clean_paragraph(html_detail)
-
-                print("\n=== HTML detail (前 1200 字) ===")
-                print(html_detail[:1200])
-                print("\n=== clean_text ===")
-                print(clean_text)
-                return
-
-        page += 1
+    # 最終輸出：不寫欄位名稱
+    df_final.to_csv(FINAL_CSV, index=False, header=False, encoding="utf-8-sig")
+    print(f"🏁 已寫入合併後最終檔案：{FINAL_CSV}")
+    print(f"📊 最終資料筆數：{len(df_final)}")
 
 
-# ---------------------------------------------------------
-# main
-# ---------------------------------------------------------
 if __name__ == "__main__":
-    df = crawl_all()
-    df.to_csv("pla_daily_clean_full.csv", index=False, encoding="utf-8-sig")
-    print("\n全部完成！筆數 =", len(df))
+    main()
