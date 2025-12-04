@@ -34,8 +34,15 @@ def crawl_list_page(page: int):
     url = build_list_url(page)
     print(f"\n🔍 抓列表頁：{url}")
 
-    r = requests.get(url, headers=HEADERS, timeout=20)
-    r.raise_for_status()
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=20)
+        r.raise_for_status()
+    except Exception as e:
+        # 🔥 關鍵：列表頁 503 或其他錯誤時，不要讓整個程式掛掉
+        print(f"⚠️ 抓取列表頁失敗：第 {page} 頁 {url} - {e}")
+        # 回傳空 list，讓 crawl_all_pages() 把這一頁視為「沒有資料」並停止往後抓
+        return []
+
     soup = BeautifulSoup(r.text, "html.parser")
 
     rows = []
