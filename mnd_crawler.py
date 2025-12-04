@@ -1,248 +1,194 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-mnd_crawler.py — 最終穩定版（依照你的指定翻頁格式）
----------------------------------------------------
-列表頁 URL 格式完全依你要求：
-
-p=1: https://www.mnd.gov.tw/news/plaactlist/
-p=2: https://www.mnd.gov.tw/news/plaactlist/2
-p=3: https://www.mnd.gov.tw/news/plaactlist/3
-...
-
-同時修正 href 解析與內頁完整 URL 組法，避免出現 www.mnd.gov.twnews。
-"""
-
-import os
-import time
-import re
-from typing import List, Dict
-from urllib.parse import urljoin
-
 import requests
 from bs4 import BeautifulSoup
+from urllib.parse import urljoin
+import re
 import pandas as pd
+import time
+import sys
+from pathlib import Path
 
-BASE = "https://www.mnd.gov.tw"
-LIST_URL = BASE + "/news/plaactlist/"
+BASE_URL = "https://www.mnd.gov.tw"
+LIST_BASE = f"{BASE_URL}/news/plaactlist"
+HEADERS = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X)"}
 
-DATA_PATH = "mnd_pla.csv"
-GAP_PATH = "manual_gap.csv"
-
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0 Safari/537.36"
-    )
-}
-
-# -----------------------------------------------------
-# 抓取工具
-# -----------------------------------------------------
-
-def fetch(url: str, session=None) -> str:
-    s = session or requests.Session()
-    r = s.get(url, headers=HEADERS, timeout=20)
-    r.encoding = "utf-8"
-    return r.text
+BASE_DIR = Path(__file__).parent
+OUTPUT_CSV = BASE_DIR / "mnd_pla.csv"
+MANUAL_GAP = BASE_DIR / "manual_gap.csv"
 
 
-def parse_list_page(html: str) -> List[Dict]:
-    """解析列表頁：抓出 date / title / url"""
-    soup = BeautifulSoup(html, "lxml")
-    records: List[Dict] = []
-
-    # 抓所有含有 plaact/ 的連結（可能是 news/plaact/... 或 /news/plaact/...）
-    for a in soup.select("a[href*='plaact/']"):
-        href = a.get("href") or ""
-
-        # ★★★ 正確 URL 組法 — 永遠不會再變成 www.mnd.gov.twnews ★★★
-        url = urljoin(BASE + "/", href)
-
-        # 從父層找日期
-        row = a.find_parent("tr") or a.find_parent("div")
-        date_str = ""
-        if row:
-            m = re.search(r"\d{3}[./]\d{2}[./]\d{2}", row.get_text())
-            if m:
-                date_str = m.group(0).replace(".", "/")
-
-        records.append({
-            "date": date_str,
-            "title": a.get_text(strip=True),
-            "url": url,
-        })
-
-    return records
-
-
-def parse_article(html: str) -> Dict[str, str]:
-    """解析內頁：抓 content 及內頁日期"""
-    soup = BeautifulSoup(html, "lxml")
-
-    main = soup.select_one(".maincontent")
-    content_text = main.get_text("\n", strip=True) if main else ""
-
-    date_str = ""
-    pageinfo = soup.select_one(".pageinfo")
-    if pageinfo:
-        spans = pageinfo.select("span")
-        if len(spans) >= 2:
-            raw = spans[1].get_text(strip=True)
-            m = re.search(r"\d{3}[./]\d{2}[./]\d{2}", raw)
-            if m:
-                date_str = m.group(0).replace(".", "/")
-
-    return {"date": date_str, "content": content_text}
-
-
-# -----------------------------------------------------
-# 爬多頁
-# -----------------------------------------------------
-
-def crawl_pages(max_page: int) -> pd.DataFrame:
-    all_rows: List[Dict] = []
-    session = requests.Session()
-
-    for page in range(1, max_page + 1):
-
-        # ★★★ 照你指定的翻頁格式 ★★★
-        if page == 1:
-            list_url = LIST_URL      # 必須結尾有 "/"
-        else:
-            list_url = LIST_URL.rstrip("/") + f"/{page}"
-
-        print(f"🔍 抓列表頁：{list_url}")
-
+# ------------------------------------------------------------
+# GET with retry
+# ------------------------------------------------------------
+def safe_get(url: str, retries=3):
+    for i in range(retries):
         try:
-            html = fetch(list_url, session=session)
+            r = requests.get(url, headers=HEADERS, timeout=20)
+            r.raise_for_status()
+            r.encoding = r.apparent_encoding
+            return r.text
         except Exception as e:
-            print(f"⚠️ 列表頁抓取失敗 {list_url}: {e}")
+            print(f"⚠️ 第 {i+1} 次失敗：{url} - {e}")
+            time.sleep(1)
+    print(f"❌ 最終失敗：{url}")
+    return None
+
+
+# ------------------------------------------------------------
+# 列表頁 URL（保留你的原版規則）
+# ------------------------------------------------------------
+def build_list_url(page: int):
+    return LIST_BASE if page == 1 else f"{LIST_BASE}/{page}"
+
+
+# ------------------------------------------------------------
+# 抓列表頁（沿用你原始條件，只抓特定標題）
+# ------------------------------------------------------------
+def crawl_list_page(page: int):
+    url = build_list_url(page)
+    print(f"\n🔍 抓列表頁：{url}")
+
+    html = safe_get(url)
+    if html is None:
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+    rows = []
+
+    for a in soup.find_all("a", href=True):
+        text = a.get_text(strip=True)
+
+        # ✔ 保留你指定的文章標題
+        if "中共解放軍臺海周邊海、空域動態" not in text:
             continue
 
-        base_records = parse_list_page(html)
-        if not base_records:
-            print(f"頁 {page} 沒抓到任何 plaact 連結，停止。")
+        # 抓日期：114.12.03
+        m = re.search(r"\d{3}\.\d{2}\.\d{2}", text)
+        if not m:
+            continue
+        roc_date = m.group(0)
+
+        article_url = urljoin(BASE_URL, a["href"])
+        rows.append({"roc_date": roc_date, "url": article_url})
+
+    print(f"📌 本頁抓到 {len(rows)} 筆")
+    return rows
+
+
+# ------------------------------------------------------------
+# 文章內文：只抓 maincontent、清除亂碼
+# ------------------------------------------------------------
+def extract_maincontent_text(html: str):
+    soup = BeautifulSoup(html, "html.parser")
+    main = soup.select_one("div.maincontent")
+    if not main:
+        return ""
+
+    text = " ".join(main.stripped_strings)
+
+    # ✔ 偵測 109/09/17 型亂碼（俄文）
+    if re.search(r"[а-яА-ЯёЁ]+", text):
+        print("⚠️ 偵測到亂碼 → 將使用補丁覆蓋")
+        return ""
+
+    return text
+
+
+def crawl_article(url: str):
+    print(f"➡️ 抓文章頁：{url}")
+    html = safe_get(url)
+    if html is None:
+        return ""
+    return extract_maincontent_text(html)
+
+
+# ------------------------------------------------------------
+# 民國日期排序
+# ------------------------------------------------------------
+def roc_sort_key(s: str):
+    try:
+        y, m, d = s.split("/")
+        return int(y), int(m), int(d)
+    except:
+        return (0, 0, 0)
+
+
+# ------------------------------------------------------------
+# 合併補丁 manual_gap.csv
+# ------------------------------------------------------------
+def apply_manual_gap(df: pd.DataFrame):
+    if MANUAL_GAP.exists():
+        print(f"📥 合併補丁：{MANUAL_GAP}")
+        gap = pd.read_csv(MANUAL_GAP, encoding="utf-8-sig")
+        df = pd.concat([df, gap], ignore_index=True)
+
+    df = df.drop_duplicates(subset=["日期"], keep="last")
+    df = df.sort_values("日期", key=lambda col: col.map(roc_sort_key))
+    return df
+
+
+# ------------------------------------------------------------
+# 全量模式：一次爬所有頁面
+# ------------------------------------------------------------
+def run_full():
+    print("🚀 [FULL] 全量模式開始")
+    all_rows = []
+
+    for page in range(1, 300):
+        entries = crawl_list_page(page)
+        if not entries:
             break
 
-        print(f"頁 {page} 抓到 {len(base_records)} 筆")
-
-        # 抓每則內頁
-        for rec in base_records:
-            art_url = rec["url"]
-            try:
-                art_html = fetch(art_url, session=session)
-            except Exception as e:
-                print(f"⚠️ 內頁抓取失敗 {art_url}: {e}")
-                continue
-
-            art = parse_article(art_html)
-
-            all_rows.append({
-                "date": art["date"] or rec["date"],
-                "title": rec["title"],
-                "url": rec["url"],
-                "content": art["content"],
-            })
-
+        for e in entries:
+            content = crawl_article(e["url"])
+            date_str = e["roc_date"].replace(".", "/")
+            all_rows.append({"日期": date_str, "內容": content})
             time.sleep(0.3)
 
     df = pd.DataFrame(all_rows)
+    df = apply_manual_gap(df)
+    df.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
 
-    if not df.empty:
-        df = df.drop_duplicates(subset=["url"], keep="last").reset_index(drop=True)
-
-    return df
-
-
-# -----------------------------------------------------
-# manual_gap
-# -----------------------------------------------------
-
-def load_manual_gap() -> pd.DataFrame:
-    if not os.path.exists(GAP_PATH):
-        print("🔍 manual_gap.csv 不存在，略過。")
-        return pd.DataFrame()
-
-    df = pd.read_csv(GAP_PATH, encoding="utf-8-sig")
-    print(f"📥 讀取補丁，共 {len(df)} 筆")
-    return df
+    print(f"✅ 全量完成，共 {len(df)} 筆")
 
 
-def merge_with_gap(main_df, gap_df):
-    if gap_df.empty:
-        return main_df.reset_index(drop=True)
+# ------------------------------------------------------------
+# 每日模式：只抓最新一筆（第 1 頁第一筆）
+# ------------------------------------------------------------
+def run_daily():
+    print("📅 [DAILY] 每日模式開始（只抓最新一筆）")
 
-    merged = pd.concat([main_df, gap_df], ignore_index=True)
-    merged = merged.drop_duplicates(subset=["url"], keep="last")
-    merged = merged.sort_values("date").reset_index(drop=True)
-    return merged
+    entries = crawl_list_page(1)
+    if not entries:
+        print("⚠️ 無資料")
+        return
 
+    newest = entries[0]
+    date_str = newest["roc_date"].replace(".", "/")
+    content = crawl_article(newest["url"])
 
-# -----------------------------------------------------
-# 全量
-# -----------------------------------------------------
+    df_new = pd.DataFrame([{"日期": date_str, "內容": content}])
 
-def build_full_dataset(max_page: int = 200):
-    print("🚀 全量重建開始")
-    df = crawl_pages(max_page=max_page)
-    print(f"🌐 共抓到 {len(df)} 筆")
-
-    gap = load_manual_gap()
-    final = merge_with_gap(df, gap)
-
-    final.to_csv(DATA_PATH, index=False, encoding="utf-8-sig")
-    print(f"✅ 已輸出 {len(final)} 筆至 {DATA_PATH}")
-
-
-# -----------------------------------------------------
-# daily
-# -----------------------------------------------------
-
-def load_existing_data():
-    if not os.path.exists(DATA_PATH):
-        print("⚠️ 找不到主檔，改跑全量。")
-        build_full_dataset()
-        return pd.read_csv(DATA_PATH, encoding="utf-8-sig")
-
-    df = pd.read_csv(DATA_PATH, encoding="utf-8-sig")
-    print(f"📥 主檔 {len(df)} 筆")
-    return df
-
-
-def daily_update(max_page: int = 3):
-    existing = load_existing_data()
-    known = set(existing["url"].tolist())
-
-    print("🌐 抓取最近幾頁找新資料")
-    recent = crawl_pages(max_page=max_page)
-
-    is_new = ~recent["url"].isin(known)
-    new_rows = recent[is_new]
-    print(f"🆕 新增 {len(new_rows)} 筆")
-
-    updated = pd.concat([existing, new_rows], ignore_index=True)
-    gap = load_manual_gap()
-    final = merge_with_gap(updated, gap)
-
-    final.to_csv(DATA_PATH, index=False, encoding="utf-8-sig")
-    print(f"✅ 寫入完畢，目前 {len(final)} 筆")
-
-
-# -----------------------------------------------------
-# main
-# -----------------------------------------------------
-
-def main():
-    mode = os.getenv("MND_MODE", "").lower()
-
-    if mode == "full":
-        build_full_dataset()
+    if OUTPUT_CSV.exists():
+        df_old = pd.read_csv(OUTPUT_CSV, encoding="utf-8-sig")
+        df = pd.concat([df_old, df_new], ignore_index=True)
     else:
-        daily_update()
+        df = df_new
+
+    df = apply_manual_gap(df)
+    df.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
+
+    print(f"✅ 已更新，共 {len(df)} 筆")
 
 
+# ------------------------------------------------------------
+# MAIN
+# ------------------------------------------------------------
 if __name__ == "__main__":
-    main()
+    # python mnd_crawler.py full
+    if len(sys.argv) > 1 and sys.argv[1] == "full":
+        run_full()
+    else:
+        run_daily()
