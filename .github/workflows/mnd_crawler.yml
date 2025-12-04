@@ -6,9 +6,8 @@ on:
     - cron: '0 6 * * *'
   workflow_dispatch:
 
-# 🔥🔥🔥 關鍵：給 workflow 寫入 repo 的權限 🔥🔥🔥
 permissions:
-  contents: write
+  contents: write   # 🔥 允許自動 commit（必要）
 
 jobs:
   crawl:
@@ -39,3 +38,4 @@ jobs:
           file_pattern: |
             pla_daily_latest.csv
             pla_daily_clean_full.csv
+          push_options: '--force-with-lease'
