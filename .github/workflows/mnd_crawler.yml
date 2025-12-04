@@ -1,51 +1,75 @@
 name: MND Crawler
 
 on:
+  # 每日台灣時間 14:00 執行（UTC 06:00）
   schedule:
-    - cron: '0 16 * * *'   # 台灣時間 00:00
+    - cron: "0 6 * * *"
+
+  # 手動觸發，可選 daily / full
   workflow_dispatch:
     inputs:
       mode:
+        description: "執行模式：daily = 只抓最新；full = 全量重建"
+        required: true
+        default: "daily"
         type: choice
-        description: full = 全量；daily = 只抓最新
-        default: daily
         options:
           - daily
           - full
 
 jobs:
-  run:
+  run-crawler:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v4
+      - name: Set up Python
+        uses: actions/setup-python@v4
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
-      - name: Install packages
+      - name: Install dependencies
         run: |
+          python -m pip install --upgrade pip
           pip install requests beautifulsoup4 pandas lxml
 
       - name: Run crawler
         run: |
+          echo "event = ${{ github.event_name }}"
+          echo "mode  = ${{ github.event.inputs.mode }}"
+          
+          # 手動觸發且選 full → 全量重建
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && \
              [ "${{ github.event.inputs.mode }}" = "full" ]; then
-            python mnd_crawler.py full
+              echo "▶ 選擇模式：full（全量重建）"
+              python mnd_crawler.py full
+
+          # 每日排程 → daily
+          elif [ "${{ github.event_name }}" = "schedule" ]; then
+              echo "▶ 排程模式：daily（抓最新一筆）"
+              python mnd_crawler.py
+
+          # push / 其他 → 預設 daily
           else
-            python mnd_crawler.py
+              echo "▶ 預設模式：daily"
+              python mnd_crawler.py
           fi
 
-      - name: Commit updated data
+      - name: Commit and push if changed
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           if git diff --quiet; then
-            echo "No changes"
+            echo "No changes to commit."
             exit 0
           fi
 
+          echo "Changes detected → committing..."
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
           git add mnd_pla.csv manual_gap.csv || true
-          git commit -m "Update data"
+          git commit -m "Update MND PLA data"
           git push
