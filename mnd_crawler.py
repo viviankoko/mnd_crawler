@@ -64,7 +64,7 @@ def crawl_list_page(page: int):
         if "中共解放軍臺海周邊海、空域動態" not in text:
             continue
 
-        # 抓日期：114.12.03
+        # 抓日期：例如 114.12.03
         m = re.search(r"\d{3}\.\d{2}\.\d{2}", text)
         if not m:
             continue
@@ -88,9 +88,9 @@ def extract_maincontent_text(html: str):
 
     text = " ".join(main.stripped_strings)
 
-    # ✔ 偵測 109/09/17 型亂碼（俄文）
+    # ✔ 偵測類似 109/09/17 那種俄文字亂碼（你說補丁是補別的區間也沒關係）
     if re.search(r"[а-яА-ЯёЁ]+", text):
-        print("⚠️ 偵測到亂碼 → 將使用補丁覆蓋")
+        print("⚠️ 偵測到亂碼 → 交給補丁處理")
         return ""
 
     return text
@@ -121,11 +121,20 @@ def roc_sort_key(s: str):
 def apply_manual_gap(df: pd.DataFrame):
     if MANUAL_GAP.exists():
         print(f"📥 合併補丁：{MANUAL_GAP}")
-        gap = pd.read_csv(MANUAL_GAP, encoding="utf-8-sig")
+        # 假設 manual_gap.csv 沒有欄位名稱、兩欄：日期,內容
+        gap = pd.read_csv(
+            MANUAL_GAP,
+            encoding="utf-8-sig",
+            header=None,
+            names=["日期", "內容"],
+        )
         df = pd.concat([df, gap], ignore_index=True)
 
-    df = df.drop_duplicates(subset=["日期"], keep="last")
-    df = df.sort_values("日期", key=lambda col: col.map(roc_sort_key))
+    # 以「日期」去重，補丁在後面 → 補丁優先
+    if "日期" in df.columns:
+        df = df.drop_duplicates(subset=["日期"], keep="last")
+        df = df.sort_values("日期", key=lambda col: col.map(roc_sort_key))
+
     return df
 
 
@@ -180,14 +189,15 @@ def run_daily():
     df = apply_manual_gap(df)
     df.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
 
-    print(f"✅ 已更新，共 {len(df)} 筆")
+    print(f"✅ 已更新，共 {len[df]} 筆")
 
 
 # ------------------------------------------------------------
 # MAIN
 # ------------------------------------------------------------
 if __name__ == "__main__":
-    # python mnd_crawler.py full
+    # python mnd_crawler.py full  → 全量
+    # python mnd_crawler.py       → 每日只抓最新
     if len(sys.argv) > 1 and sys.argv[1] == "full":
         run_full()
     else:
