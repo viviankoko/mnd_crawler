@@ -60,18 +60,19 @@ def parse_list_page(html: str) -> List[Dict]:
     """
     解析列表頁，回傳每一筆的 date / title / url。
 
-    註：這裡用 /news/plaact/ 作為標記，
-    如果你列表頁的 HTML 結構跟這裡假設的有差，調整 selector 即可。
+    重點：
+    - selector 用 a[href*="plaact/"]，因為列表裡 href 多半是相對路徑
+      例如 "news/plaact/85454" 或 "/news/plaact/85454"。
     """
     soup = BeautifulSoup(html, "lxml")
     records: List[Dict] = []
 
-    for a in soup.select("a[href*='/news/plaact/']"):
+    for a in soup.select("a[href*='plaact/']"):
         href = a.get("href") or ""
         if not href:
             continue
 
-        # 組成完整網址
+        # 組成完整網址（支援相對＋絕對）
         if href.startswith("http"):
             url = href
         else:
@@ -128,6 +129,8 @@ def parse_article(html: str) -> Dict[str, str]:
 def crawl_pages(max_page: int) -> pd.DataFrame:
     """
     從第 1 頁爬到 max_page。
+    - 第 1 頁： https://www.mnd.gov.tw/news/plaactlist
+    - 後續頁： https://www.mnd.gov.tw/news/plaactlist/2, /3, ...
     - 每頁解析列表，抓出每則的 url，再去爬內頁。
     - 以 url 去重，避免重複。
     - 若某頁完全抓不到任何 plaact 連結，就當作到尾端直接 break。
@@ -136,7 +139,12 @@ def crawl_pages(max_page: int) -> pd.DataFrame:
     session = requests.Session()
 
     for page in range(1, max_page + 1):
-        list_url = f"{LIST_URL}/{page}"
+        if page == 1:
+            list_url = LIST_URL
+        else:
+            list_url = f"{LIST_URL}/{page}"
+
+        print(f"🔍 抓列表頁：{list_url}")
         try:
             html = fetch(list_url, session=session)
         except Exception as e:
@@ -260,9 +268,6 @@ def daily_update(max_page: int = 3):
     2. 去抓最近幾頁（預設 3 頁）的資料
     3. 只挑出「url 不在主檔」的那些 → 視為新資料
     4. append 進主檔，再與 manual_gap 合併，輸出回 mnd_pla.csv
-
-    實務上大多數天只會新增 0 或 1 筆，
-    但這個寫法可以保證「如果那天國防部突然多發幾篇，也不會漏掉」。
     """
     existing = load_existing_data()
     known_urls = set(existing.get("url", []))
