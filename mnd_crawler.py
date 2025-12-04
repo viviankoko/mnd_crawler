@@ -1,277 +1,304 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
+"""
+mnd_crawler.py
+
+用途：
+1. 第一次跑（全量）：從國防部「區域動態」把目前所有資料爬完，
+   然後把 manual_gap.csv 併進去 → 輸出 mnd_pla.csv。
+2. 之後每天跑（增量）：只抓最近幾頁，找出「還沒寫進 mnd_pla.csv」的新資料，
+   append 進去，再併一次 manual_gap.csv → 覆蓋回 mnd_pla.csv。
+
+使用方式：
+- 第一次全量重建：
+    在終端機執行：
+      MND_MODE=full python mnd_crawler.py
+    （Windows 可以用：set MND_MODE=full && python mnd_crawler.py）
+
+- 之後每日排程：
+    直接：
+      python mnd_crawler.py
+    （或在 GitHub Actions 裡不設定 MND_MODE）
+"""
+
+import os
+import time
+import re
+from typing import List, Dict
+
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin
-from pathlib import Path
-import re
 import pandas as pd
-import time
 
-BASE_URL = "https://www.mnd.gov.tw"
-LIST_BASE = f"{BASE_URL}/news/plaactlist"
+BASE = "https://www.mnd.gov.tw"
+LIST_URL = BASE + "/news/plaactlist"
+
+DATA_PATH = "mnd_pla.csv"     # 主資料表
+GAP_PATH  = "manual_gap.csv"  # 你的補丁檔
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X)"
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0 Safari/537.36"
+    )
 }
 
-BASE_DIR = Path(__file__).parent
 
-# 檔案路徑（都放在 repo 根目錄）
-MANUAL_CSV = BASE_DIR / "manual_gap.csv"          # 手動補的缺口
-LATEST_CSV = BASE_DIR / "pla_daily_latest.csv"    # 這次爬到的最新 raw 資料（無欄位名稱）
-FINAL_CSV = BASE_DIR / "pla_daily_clean_full.csv" # 合併後最終檔案（有「日期,內容」欄位）
+# ---------- 抓取＆解析 ----------
 
-# 關鍵字：沿用你 ASPX 舊版爬蟲的篩選標準
-KEYWORDS = [
-    "中共解放軍臺海周邊海、空域動態",
-    "中共解放軍軍機",
-    "中共解放軍進入我西南空域活動情況",
-    "踰越海峽中線及進入我西南空域活動情況",
-    "逾越海峽中線及進入我西南空域活動情況",
-    "我西南空域空情動態",
-    "臺海周邊空域空情動態",
-    "偵獲共機、艦在臺海周邊活動情形",
-]
-
-# 共用 Session（效能好一點）
-SESSION = requests.Session()
+def fetch(url: str, session: requests.Session | None = None) -> str:
+    """抓網頁，強制用 UTF-8 解碼。"""
+    s = session or requests.Session()
+    r = s.get(url, headers=HEADERS, timeout=20)
+    r.encoding = "utf-8"
+    return r.text
 
 
-# ------------------------------------------------------------
-# 工具：帶 retry 的 GET（列表頁、內頁共用）
-# ------------------------------------------------------------
-def safe_get(url: str, max_retries: int = 5, timeout: int = 40, sleep_base: float = 2.0):
+def parse_list_page(html: str) -> List[Dict]:
     """
-    帶重試機制的 GET：
-    - 失敗時會最多重試 max_retries 次
-    - 最後仍失敗就回傳 None（呼叫端自己決定怎麼處理）
+    解析列表頁，回傳每一筆的 date / title / url。
+
+    註：這裡用 /news/plaact/ 作為標記，
+    如果你列表頁的 HTML 結構跟這裡假設的有差，調整 selector 即可。
     """
-    for attempt in range(1, max_retries + 1):
-        try:
-            r = SESSION.get(url, headers=HEADERS, timeout=timeout)
-            r.raise_for_status()
-            r.encoding = r.apparent_encoding
-            return r.text
-        except Exception as e:
-            print(f"⚠️ 第 {attempt} 次抓取失敗：{url} - {e}")
-            if attempt == max_retries:
-                print(f"❌ 放棄抓取：{url}")
-                return None
-            # 遞增等待時間（2 秒、4 秒、6 秒…）
-            time.sleep(sleep_base * attempt)
+    soup = BeautifulSoup(html, "lxml")
+    records: List[Dict] = []
 
+    for a in soup.select("a[href*='/news/plaact/']"):
+        href = a.get("href") or ""
+        if not href:
+            continue
 
-# ------------------------------------------------------------
-# 列表頁
-# ------------------------------------------------------------
-def build_list_url(page: int) -> str:
-    """page=1: /plaactlist, page>=2: /plaactlist/2"""
-    return LIST_BASE if page == 1 else f"{LIST_BASE}/{page}"
+        # 組成完整網址
+        if href.startswith("http"):
+            url = href
+        else:
+            url = BASE + href.lstrip("/")
 
+        # 往上找父層，從文字裡抓日期（109.09.17 / 109/09/17）
+        row = a.find_parent("tr") or a.find_parent("div")
+        date_str = ""
+        if row:
+            m = re.search(r"\d{3}[./]\d{2}[./]\d{2}", row.get_text())
+            if m:
+                date_str = m.group(0).replace(".", "/")
 
-def crawl_list_page(page: int):
-    """
-    抓某一頁列表，只留我們關心的關鍵字標題。
-    回傳：
-        - list[dict]，每個元素：{roc_date, url}
-        - 若整頁讀取失敗：回傳 None（給上層判斷「略過這一頁」）
-    """
-    url = build_list_url(page)
-    print(f"\n🔍 抓列表頁：{url}")
-
-    html = safe_get(url, max_retries=5, timeout=40)
-    if html is None:
-        # 明確標記這一頁失敗（與「正常但剛好沒有資料」區分）
-        print(f"⚪ 第 {page} 頁抓取失敗，略過。")
-        return None
-
-    soup = BeautifulSoup(html, "html.parser")
-    rows = []
-
-    # 目前網站列表的日期通常直接寫在 a 文字前面，例如：
-    # 111.11.08 11月8日臺海周邊空域空情動態新聞稿
-    for a in soup.find_all("a", href=True):
         title = a.get_text(strip=True)
-        if not any(kw in title for kw in KEYWORDS):
-            continue
-
-        # 抓 ROC 日期 111.11.08
-        m = re.search(r"\d{3}\.\d{2}\.\d{2}", title)
-        if not m:
-            # 有些舊文可能沒帶這種格式，直接略過
-            continue
-        roc_date = m.group(0)
-
-        href = a.get("href")
-        article_url = urljoin(BASE_URL, href)
-
-        rows.append(
+        records.append(
             {
-                "roc_date": roc_date,
-                "url": article_url,
+                "date": date_str,  # 發布日（列表上的）
+                "title": title,
+                "url": url,
             }
         )
 
-    print(f"📌 本頁抓到 {len(rows)} 筆")
-    return rows
+    return records
 
 
-# ------------------------------------------------------------
-# 文章頁擷取
-# ------------------------------------------------------------
-def extract_maincontent_text(html: str) -> str:
+def parse_article(html: str) -> Dict[str, str]:
     """
-    只取 <div class="maincontent"> 裡面的文字，
-    串成一行：
-    「國防部今（8）日表示，迄1700時止，偵獲共機…」
-    """
-    soup = BeautifulSoup(html, "html.parser")
-    main_div = soup.select_one("div.maincontent")
-    if main_div is None:
-        return ""
+    解析內頁，抓 maincontent 的完整文字，以及 pageinfo 裡的日期。
 
-    parts = list(main_div.stripped_strings)
-    return " ".join(parts)
-
-
-def crawl_article_text(url: str) -> str:
-    print(f"➡️ 抓文章頁：{url}")
-    html = safe_get(url, max_retries=3, timeout=30)
-    if html is None:
-        # 內頁真的抓不到就留空字串，但不讓整個流程掛掉
-        return ""
-    return extract_maincontent_text(html)
-
-
-# ------------------------------------------------------------
-# 日期排序（民國年）
-# ------------------------------------------------------------
-def roc_to_sort_key(s: str):
-    """
-    把 '114/12/03' 轉成排序用 tuple (114, 12, 3)
-    """
-    try:
-        y, m, d = s.split("/")
-        return int(y), int(m), int(d)
-    except Exception:
-        return (0, 0, 0)
-
-
-# ------------------------------------------------------------
-# 主流程：抓所有頁面
-# ------------------------------------------------------------
-def crawl_all_pages(max_pages: int = 200):
-    """
-    從第 1 頁一路抓到 max_pages。
-    特點：
-      - 某一頁整頁 timeout → 記錄在 skipped_pages，繼續下一頁
-      - 若連續 3 頁是「正常但沒有任何符合關鍵字的資料」才停止
     回傳：
-      df_new: DataFrame(欄位：日期, 內容，日期為民國年格式 114/12/03)
-      skipped_pages: list[int] 被略過的頁碼
+      {"date": "109/09/17", "content": "...全文..."}
     """
-    data_rows = []
-    skipped_pages = []
-    empty_streak = 0
+    soup = BeautifulSoup(html, "lxml")
 
-    for page in range(1, max_pages + 1):
-        entries = crawl_list_page(page)
+    main = soup.select_one(".maincontent")
+    if main:
+        content_text = main.get_text("\n", strip=True)
+    else:
+        content_text = ""
 
-        # 整頁抓取失敗：略過
-        if entries is None:
-            skipped_pages.append(page)
+    date_str = ""
+    pageinfo = soup.select_one(".pageinfo")
+    if pageinfo:
+        spans = pageinfo.select("span")
+        if len(spans) >= 2:
+            raw = spans[1].get_text(strip=True)  # 例如 "109.09.17"
+            m = re.search(r"\d{3}[./]\d{2}[./]\d{2}", raw)
+            if m:
+                date_str = m.group(0).replace(".", "/")
+
+    return {"date": date_str, "content": content_text}
+
+
+def crawl_pages(max_page: int) -> pd.DataFrame:
+    """
+    從第 1 頁爬到 max_page。
+    - 每頁解析列表，抓出每則的 url，再去爬內頁。
+    - 以 url 去重，避免重複。
+    - 若某頁完全抓不到任何 plaact 連結，就當作到尾端直接 break。
+    """
+    all_rows: List[Dict] = []
+    session = requests.Session()
+
+    for page in range(1, max_page + 1):
+        list_url = f"{LIST_URL}/{page}"
+        try:
+            html = fetch(list_url, session=session)
+        except Exception as e:
+            print(f"⚠️ 列表頁抓取失敗 {list_url}: {e}")
             continue
 
-        # 正常但沒有符合關鍵字的資料
-        if not entries:
-            empty_streak += 1
-            print(f"🔚 第 {page} 頁無符合關鍵字的資料（連續 {empty_streak} 頁）")
-            # 這裡採「連續 3 頁空」就停止，避免某一頁剛好沒有資料就提早結束
-            if empty_streak >= 3:
-                print("📴 連續 3 頁無資料，停止後續抓取。")
-                break
-            else:
+        base_records = parse_list_page(html)
+        if not base_records:
+            print(f"頁 {page} 沒抓到任何 plaact 連結，視為到尾端，停止。")
+            break
+
+        print(f"頁 {page} 抓到 {len(base_records)} 筆")
+
+        for rec in base_records:
+            art_url = rec["url"]
+            try:
+                art_html = fetch(art_url, session=session)
+            except Exception as e:
+                print(f"  ⚠️ 內頁抓取失敗 {art_url}: {e}")
                 continue
 
-        # 有資料 → reset 空頁計數
-        empty_streak = 0
+            art = parse_article(art_html)
+            row = {
+                "date": art["date"] or rec["date"],  # 內頁日期優先，沒有就用列表的
+                "title": rec["title"],
+                "url": rec["url"],
+                "content": art["content"],
+            }
+            all_rows.append(row)
 
-        for entry in entries:
-            text = crawl_article_text(entry["url"])
-            date_str = entry["roc_date"].replace(".", "/")  # 111.11.08 -> 111/11/08
+            # 禮貌性 sleep，別把官方網站打爆
+            time.sleep(0.3)
 
-            data_rows.append(
-                {
-                    "日期": date_str,
-                    "內容": text,
-                }
-            )
+    df = pd.DataFrame(all_rows)
 
-        # 避免太兇猛被當機器人，頁與頁間稍微睡一下
-        time.sleep(1.0)
+    if not df.empty and "url" in df.columns:
+        df = df.drop_duplicates(subset=["url"], keep="last").reset_index(drop=True)
 
-    df = pd.DataFrame(data_rows)
-    return df, skipped_pages
+    return df
 
 
-# ------------------------------------------------------------
-# 合併 manual_gap.csv
-# ------------------------------------------------------------
-def merge_with_manual(df_new: pd.DataFrame) -> pd.DataFrame:
+# ---------- manual_gap 合併 ----------
+
+def load_manual_gap() -> pd.DataFrame:
+    """讀進 manual_gap.csv，如果沒有就回傳空 DataFrame。"""
+    if not os.path.exists(GAP_PATH):
+        print("🔍 manual_gap.csv 不存在，略過補丁。")
+        return pd.DataFrame()
+
+    print(f"📥 讀取補丁檔：{GAP_PATH}")
+    gap_df = pd.read_csv(GAP_PATH, encoding="utf-8-sig")
+    print(f"  → {len(gap_df)} 筆補丁資料")
+    return gap_df
+
+
+def merge_with_gap(main_df: pd.DataFrame, gap_df: pd.DataFrame) -> pd.DataFrame:
     """
-    把這次爬到的 df_new 跟 manual_gap.csv 合併。
-    manual_gap.csv 每列格式：
-        114/11/29,中共解放軍臺海周邊海、空域動態 一、日期：…
-    （沒有欄位名稱）
+    把主資料表與 manual_gap 合併。
+
+    規則：
+    - 以 url 當唯一 key。
+    - manual_gap 放在後面：如果同一個 url 主檔和補丁都有，以補丁版本為準。
     """
-    if MANUAL_CSV.exists():
-        print(f"📥 讀取手動補齊檔案：{MANUAL_CSV}")
-        df_manual = pd.read_csv(MANUAL_CSV, header=None, names=["日期", "內容"])
+    if gap_df.empty:
+        return main_df.reset_index(drop=True)
+
+    merged = pd.concat([main_df, gap_df], ignore_index=True)
+
+    if "url" in merged.columns:
+        merged = merged.drop_duplicates(subset=["url"], keep="last")
+    elif set(["date", "title"]).issubset(merged.columns):
+        merged = merged.drop_duplicates(subset=["date", "title"], keep="last")
     else:
-        print("⚠️ 未找到 manual_gap.csv，僅使用本次爬到的資料。")
-        df_manual = pd.DataFrame(columns=["日期", "內容"])
+        merged = merged.drop_duplicates(keep="last")
 
-    # 個別去重
-    df_manual = df_manual.drop_duplicates(subset=["日期"], keep="first")
-    df_new = df_new.drop_duplicates(subset=["日期"], keep="first")
+    if "date" in merged.columns:
+        merged = merged.sort_values("date").reset_index(drop=True)
 
-    # manual 在前，新爬在後
-    df_all = pd.concat([df_manual, df_new], ignore_index=True)
-
-    # 再以「日期」去重，保留第一次（優先 manual）
-    df_all = df_all.drop_duplicates(subset=["日期"], keep="first")
-
-    # 依民國年月日排序
-    df_all = df_all.sort_values(by="日期", key=lambda col: col.map(roc_to_sort_key))
-
-    return df_all
+    return merged
 
 
-# ------------------------------------------------------------
-# main()
-# ------------------------------------------------------------
+# ---------- 模式 A：全量重建 ----------
+
+def build_full_dataset(max_page: int = 200):
+    """
+    從第 1 頁一路爬到 max_page（遇到空頁就提前停），
+    把目前所有區域動態都抓下來，再與 manual_gap 合併，輸出 mnd_pla.csv。
+
+    ✔ 這一步完全不讀舊 CSV → 可把 109/09/17 之前留下的亂碼整個洗掉。
+    """
+    print("🚀 開始全量重建（從網站抓到現在所有資料）")
+    df = crawl_pages(max_page=max_page)
+    print(f"🌐 從網站共抓到 {len(df)} 筆")
+
+    gap_df = load_manual_gap()
+    final = merge_with_gap(df, gap_df)
+
+    final.to_csv(DATA_PATH, index=False, encoding="utf-8-sig")
+    print(f"✅ 全量重建完成，已輸出 {len(final)} 筆到 {DATA_PATH}")
+
+
+# ---------- 模式 B：每日增量更新 ----------
+
+def load_existing_data() -> pd.DataFrame:
+    """讀入既有的 mnd_pla.csv；若找不到就自動跑一次全量重建。"""
+    if not os.path.exists(DATA_PATH):
+        print("⚠️ 找不到既有主檔，先跑全量重建。")
+        build_full_dataset()
+        return pd.read_csv(DATA_PATH, encoding="utf-8-sig")
+
+    print(f"📥 讀取既有主檔：{DATA_PATH}")
+    df = pd.read_csv(DATA_PATH, encoding="utf-8-sig")
+    print(f"  → {len(df)} 筆")
+    return df
+
+
+def daily_update(max_page: int = 3):
+    """
+    每日更新：
+    1. 讀既有主檔 mnd_pla.csv
+    2. 去抓最近幾頁（預設 3 頁）的資料
+    3. 只挑出「url 不在主檔」的那些 → 視為新資料
+    4. append 進主檔，再與 manual_gap 合併，輸出回 mnd_pla.csv
+
+    實務上大多數天只會新增 0 或 1 筆，
+    但這個寫法可以保證「如果那天國防部突然多發幾篇，也不會漏掉」。
+    """
+    existing = load_existing_data()
+    known_urls = set(existing.get("url", []))
+
+    print("🌐 抓取最近幾頁（預設 3 頁）找新資料…")
+    recent_df = crawl_pages(max_page=max_page)
+    if recent_df.empty:
+        print("⚠️ 最近頁面沒有抓到任何資料，結束。")
+        return
+
+    is_new = ~recent_df["url"].isin(known_urls)
+    new_rows = recent_df[is_new]
+    print(f"🆕 找到 {len(new_rows)} 筆「主檔裡沒有的」新資料")
+
+    if new_rows.empty:
+        print("✅ 沒有新資料，主檔維持不變。")
+        return
+
+    updated = pd.concat([existing, new_rows], ignore_index=True)
+    gap_df = load_manual_gap()
+    final = merge_with_gap(updated, gap_df)
+
+    final.to_csv(DATA_PATH, index=False, encoding="utf-8-sig")
+    print(f"✅ 已寫入新資料，現在共有 {len(final)} 筆到 {DATA_PATH}")
+
+
+# ---------- 入口點 ----------
+
 def main():
-    print("🚀 開始爬取國防部區域動態…")
-
-    df_new, skipped_pages = crawl_all_pages(max_pages=200)
-    print(f"\n✅ 本次共爬到 {len(df_new)} 筆資料")
-
-    if skipped_pages:
-        print(f"⚠️ 有被略過的列表頁（完整 timeout）：{skipped_pages}")
-
-    # 最新一輪 raw 資料（維持無欄位名稱）
-    if len(df_new) > 0:
-        df_new.to_csv(LATEST_CSV, index=False, header=False, encoding="utf-8-sig")
-        print(f"📝 已寫入最新爬取資料（無欄位名稱）：{LATEST_CSV}")
+    mode = os.getenv("MND_MODE", "").lower()
+    if mode == "full":
+        # 一次性全量：第一次建檔，或哪天你想重建都可以再跑
+        build_full_dataset()
     else:
-        print("⚠️ 本次沒有爬到任何新資料，LATEST 檔不會覆蓋。")
-
-    # 合併 manual_gap + 本次新資料 → 最終完整資料（有欄位名稱）
-    df_final = merge_with_manual(df_new)
-    df_final.to_csv(FINAL_CSV, index=False, header=True, encoding="utf-8-sig")
-
-    print(f"🏁 已寫入最終完整資料（含標題列）：{FINAL_CSV}")
-    print(f"📊 最終資料筆數：{len(df_final)}")
+        # 例行：每天排程跑這個
+        daily_update()
 
 
 if __name__ == "__main__":
