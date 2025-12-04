@@ -1,20 +1,33 @@
-name: Auto update PLA daily data
+name: MND PLA Crawler
 
 on:
+  # 每天定時跑（GitHub 用 UTC，這裡是 16:00 UTC ≈ 台灣 / 韓國時間 00:00）
   schedule:
-    # 每天台灣時間 14:00 執行（台灣 +8 → UTC 06:00）
-    - cron: '0 6 * * *'
-  workflow_dispatch:
+    - cron: '0 16 * * *'
 
-permissions:
-  contents: write   # 🔥 允許自動 commit（必要）
+  # 手動觸發，順便讓你選要跑 full 還是 daily
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: '執行模式：full = 全量重建；daily = 只抓新資料'
+        required: true
+        default: 'daily'
+        type: choice
+        options:
+          - daily
+          - full
+
+  # 可選：push 到 main 也跑一次（如果你不需要可以整段刪掉）
+  push:
+    branches:
+      - main
 
 jobs:
-  crawl:
+  run-crawler:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
+      - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -25,17 +38,45 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install requests beautifulsoup4 lxml pandas
 
-      - name: Run crawler
+      - name: Run crawler (full / daily)
         run: |
-          python mnd_crawler.py
+          echo "event_name = ${{ github.event_name }}"
+          echo "mode input = ${{ github.event.inputs.mode }}"
 
-      - name: Commit and push updated CSV
-        uses: stefanzweifel/git-auto-commit-action@v5
-        with:
-          commit_message: "Auto update PLA daily data"
-          file_pattern: |
-            pla_daily_latest.csv
-            pla_daily_clean_full.csv
-          push_options: '--force-with-lease'
+          # 如果是手動觸發且選 full，就跑全量重建
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.mode }}" = "full" ]; then
+            echo "▶ 手動：全量重建 (MND_MODE=full)"
+            MND_MODE=full python mnd_crawler.py
+
+          # 如果是排程，就跑 daily（只抓新資料）
+          elif [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "▶ 排程：每日增量更新"
+            python mnd_crawler.py
+
+          # 其他情況（例如 push 觸發），也一律跑 daily
+          else
+            echo "▶ 其他觸發：預設跑每日增量更新"
+            python mnd_crawler.py
+          fi
+
+      - name: Commit and push if changed
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 看看有沒有差異
+          if git diff --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          echo "Changes detected, committing..."
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # 主要只需要 add 資料檔，如果你還有別的自動產生檔案也可以一起加
+          git add mnd_pla.csv manual_gap.csv || true
+
+          git commit -m "Update MND PLA data [skip ci]"
+          git push
