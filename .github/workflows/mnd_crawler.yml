@@ -2,9 +2,13 @@ name: Auto update PLA daily data
 
 on:
   schedule:
-    # 每天台灣時間 14:00 執行（台灣 +8，換算 UTC 06:00）
+    # 每天台灣時間 14:00 執行（台灣 +8 → UTC 06:00）
     - cron: '0 6 * * *'
-  workflow_dispatch:  # 也可以在 Actions 頁面手動按下執行
+  workflow_dispatch:
+
+# 🔥🔥🔥 關鍵：給 workflow 寫入 repo 的權限 🔥🔥🔥
+permissions:
+  contents: write
 
 jobs:
   crawl:
@@ -32,7 +36,6 @@ jobs:
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: "Auto update PLA daily data"
-          # 會自動 commit 這兩個檔案
           file_pattern: |
             pla_daily_latest.csv
             pla_daily_clean_full.csv
