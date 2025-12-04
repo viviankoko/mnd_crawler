@@ -25,23 +25,28 @@ FINAL_CSV = BASE_DIR / "pla_daily_clean_full.csv"
 # 工具：Retry 包裝（列表頁、文章頁共用）
 # ------------------------------------------------------------
 def safe_get(url: str, max_retries: int = 3, timeout: int = 20):
-    """以 retry 方式抓取頁面，失敗會回傳 None（不讓程式 crash）"""
+    """
+    具有 retry 的 GET，失敗會回傳 None（不讓程式 crash）
+    """
     for attempt in range(1, max_retries + 1):
         try:
             r = requests.get(url, headers=HEADERS, timeout=timeout)
             r.raise_for_status()
             r.encoding = r.apparent_encoding
             return r.text
+
         except Exception as e:
             print(f"⚠️ 第 {attempt} 次抓取失敗：{url} - {e}")
+
             if attempt == max_retries:
                 print(f"❌ 放棄抓取（最終失敗）：{url}")
                 return None
+
             time.sleep(2)
 
 
 # ------------------------------------------------------------
-# 列表頁（有 retry、防 timeout、防 503、不讓 workflow 崩）
+# 列表頁（retry、防 timeout、防 503、不讓 workflow 崩）
 # ------------------------------------------------------------
 def build_list_url(page: int) -> str:
     return LIST_BASE if page == 1 else f"{LIST_BASE}/{page}"
@@ -53,8 +58,8 @@ def crawl_list_page(page: int):
 
     html = safe_get(url)
     if html is None:
-        print(f"⚠️ 列表頁失敗，視為無資料 → 停止抓取後續頁面")
-        return []  # 讓 crawl_all_pages() 停止
+        print(f"⚠️ 列表頁失敗 → 視為無資料，停止後續抓取")
+        return []  # 這會讓 crawl_all_pages() 停止，但不 crash
 
     soup = BeautifulSoup(html, "html.parser")
     rows = []
@@ -87,11 +92,12 @@ def crawl_list_page(page: int):
 
 
 # ------------------------------------------------------------
-# 文章頁擷取（有 retry、防噪音）
+# 文章頁擷取（retry、防噪音）
 # ------------------------------------------------------------
 def extract_maincontent_text(html: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
     main_div = soup.select_one("div.maincontent")
+
     if main_div is None:
         return ""
 
@@ -110,7 +116,7 @@ def crawl_article_text(url: str) -> str:
 
 
 # ------------------------------------------------------------
-# 日期排序工具（民國年）
+# 民國年月日排序
 # ------------------------------------------------------------
 def roc_to_sort_key(s: str):
     try:
@@ -121,7 +127,7 @@ def roc_to_sort_key(s: str):
 
 
 # ------------------------------------------------------------
-# 主流程：抓所有頁面
+# 主流程
 # ------------------------------------------------------------
 def crawl_all_pages(max_pages: int = 200) -> pd.DataFrame:
     data_rows = []
@@ -130,7 +136,7 @@ def crawl_all_pages(max_pages: int = 200) -> pd.DataFrame:
         entries = crawl_list_page(page)
 
         if not entries:
-            print(f"⚪ 第 {page} 頁無資料，結束抓取。")
+            print(f"⚪ 第 {page} 頁無資料，終止抓取")
             break
 
         for entry in entries:
@@ -148,14 +154,14 @@ def crawl_all_pages(max_pages: int = 200) -> pd.DataFrame:
 
 
 # ------------------------------------------------------------
-# 合併 manual_gap.csv
+# 合併手動補齊資料
 # ------------------------------------------------------------
 def merge_with_manual(df_new: pd.DataFrame) -> pd.DataFrame:
     if MANUAL_CSV.exists():
-        print(f"📥 讀取手動補齊檔案：{MANUAL_CSV}")
+        print(f"📥 讀取手動補齊：{MANUAL_CSV}")
         df_manual = pd.read_csv(MANUAL_CSV, header=None, names=["日期", "內容"])
     else:
-        print("⚠️ 未找到 manual_gap.csv")
+        print("⚠️ 找不到 manual_gap.csv")
         df_manual = pd.DataFrame(columns=["日期", "內容"])
 
     df_manual = df_manual.drop_duplicates(subset=["日期"], keep="first")
@@ -163,6 +169,7 @@ def merge_with_manual(df_new: pd.DataFrame) -> pd.DataFrame:
 
     df_all = pd.concat([df_manual, df_new], ignore_index=True)
     df_all = df_all.drop_duplicates(subset=["日期"], keep="first")
+
     df_all = df_all.sort_values(by="日期", key=lambda col: col.map(roc_to_sort_key))
 
     return df_all
@@ -172,19 +179,19 @@ def merge_with_manual(df_new: pd.DataFrame) -> pd.DataFrame:
 # main()
 # ------------------------------------------------------------
 def main():
-    print("🚀 開始爬取國防部區域動態…")
+    print("🚀 開始爬取國防部公告…")
 
     df_new = crawl_all_pages()
-    print(f"\n✅ 本次共爬到 {len(df_new)} 筆資料")
+    print(f"\n✅ 共爬到 {len(df_new)} 筆資料")
 
     if len(df_new) > 0:
         df_new.to_csv(LATEST_CSV, index=False, header=False, encoding="utf-8-sig")
-        print(f"📝 已寫入最新爬取資料：{LATEST_CSV}")
+        print(f"📝 已輸出最新資料：{LATEST_CSV}")
 
     df_final = merge_with_manual(df_new)
     df_final.to_csv(FINAL_CSV, index=False, header=False, encoding="utf-8-sig")
 
-    print(f"🏁 已寫入最終完整資料：{FINAL_CSV}")
+    print(f"🏁 已輸出最終資料：{FINAL_CSV}")
     print(f"📊 最終筆數：{len(df_final)}")
 
 
