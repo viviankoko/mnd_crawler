@@ -2,297 +2,447 @@
 # -*- coding: utf-8 -*-
 
 """
-最終版 mnd_crawler.py（你直接貼這份就能用）
+mnd_crawler.py（西元日期＋補丁覆蓋版）
 
-✔ 使用你提供的、已確認可爬到所有資料的「舊 ASP.NET 架構」爬蟲
-✔ 日期統一轉成西元 YYYY-MM-DD
-✔ 套用 manual_gap.csv 補丁（完全覆蓋同一天）
-✔ 補丁合併後按日期由新→舊排序
-✔ CSV 不加引號、不換行
-✔ 自動偵測最後一頁，不會抓到 126 之後亂跑
+功能：
+- full：把目前網站上所有「區域動態」的共機/海域公告抓下來 → mnd_pla.csv
+- daily：每天只抓最新一筆，append 到 mnd_pla.csv
+- manual_gap.csv：補不了的日期用這個補，最後會一起 merge 進 mnd_pla.csv
+
+調整重點：
+1. 列表頁仍用 https://www.mnd.gov.tw/news/plaactlist (+ /2, /3, ...)
+2. 內頁仍只抓 <div class="maincontent">
+3. 把民國日期（例如 114.02.03）轉成西元 YYYY-MM-DD
+4. 多存兩欄：標題、來源網址
+5. manual_gap.csv 至少要有：日期, 內容
+   - 日期可寫：2025/2/3, 2025-02-03, 114/2/3, 114年2月3日……
+   - 會統一轉成西元 YYYY-MM-DD
+   - 若缺標題／來源網址會補預設值
+6. 補丁規則：
+   - 以日期為 key
+   - 先刪掉原始資料中同日期的列，再把補丁加進來（補丁覆蓋）
 """
+
+import sys
+import time
+import re
+from pathlib import Path
+from typing import List, Dict
 
 import requests
 from bs4 import BeautifulSoup
-import re
 import pandas as pd
-import time
-from pathlib import Path
 from datetime import datetime
 
 
-# -------------------------
-# 路徑設定
-# -------------------------
+# ------------------------------------------------------------
+# 常數設定
+# ------------------------------------------------------------
+BASE_URL = "https://www.mnd.gov.tw"
+LIST_BASE = f"{BASE_URL}/news/plaactlist"
+HEADERS = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X)"}
+
 BASE_DIR = Path(__file__).parent
-OUTPUT_CSV = BASE_DIR / "mnd_pla_air_sea.csv"
+OUTPUT_CSV = BASE_DIR / "mnd_pla.csv"
 MANUAL_GAP = BASE_DIR / "manual_gap.csv"
 
-BASE_URL = "https://www.mnd.gov.tw/PublishTable.aspx?Types=即時軍事動態&title=國防消息"
-HEADERS = {"User-Agent": "Mozilla/5.0"}
+# 你原本 ASPX 版本的關鍵字（確定抓得到所有版本的共機公告）
+KEYWORDS = [
+    "中共解放軍臺海周邊海、空域動態",
+    "中共解放軍軍機",
+    "中共解放軍進入我西南空域活動情況",
+    "踰越海峽中線及進入我西南空域活動情況",
+    "逾越海峽中線及進入我西南空域活動情況",
+    "我西南空域空情動態",
+    "臺海周邊空域空情動態",
+    "偵獲共機、艦在臺海周邊活動情形",
+]
 
 
-# -------------------------
-# 民國/西元日期處理
-# -------------------------
-def normalize_date(date_str: str) -> str:
+# ------------------------------------------------------------
+# 日期工具：全部轉成西元 YYYY-MM-DD
+# ------------------------------------------------------------
+def normalize_date_to_iso(date_str: str) -> str:
     """
-    接受格式：
+    把輸入字串轉成西元 YYYY-MM-DD
+
+    支援範例：
     - 2025/2/3
-    - 114/9/23（民國 → +1911）
-    - 109.09.17
+    - 2025/02/03
     - 2025-02-03
-    最終輸出 YYYY-MM-DD
+    - 114/2/3（民國年 → 自動 +1911）
+    - 114年2月3日
+    - 114.02.03（會先被呼叫者轉成斜線）
     """
     if not isinstance(date_str, str):
-        return ""
+        raise ValueError(f"日期不是字串: {date_str!r}")
 
     s = date_str.strip()
-    s = re.sub(r"[年月日.\-]", "/", s)
-    s = re.sub(r"/+", "/", s).strip("/")
+    if not s:
+        raise ValueError("日期是空字串")
 
-    parts = s.split("/")
+    # 如果本來就是 YYYY-MM-DD，試著 parse 一下，成功就直接回傳
+    try:
+        dt = datetime.strptime(s, "%Y-%m-%d")
+        return dt.strftime("%Y-%m-%d")
+    except ValueError:
+        pass
+
+    # 統一把中文年月日、點、減號都換成斜線
+    s_clean = re.sub(r"[年月日.\-]", "/", s)
+    s_clean = re.sub(r"/+", "/", s_clean).strip("/")
+
+    parts = s_clean.split("/")
     if len(parts) != 3:
-        return ""
+        raise ValueError(f"無法解析日期格式: {date_str!r}（清洗後: {s_clean!r}）")
 
     y, m, d = parts
-    y = int(y)
-    if y < 1911:  # 民國年
-        y += 1911
+    y = y.strip()
+    m = m.strip()
+    d = d.strip()
 
-    m = int(m)
-    d = int(d)
-    return f"{y:04d}-{m:02d}-{d:02d}"
+    year = int(y)
+    # 粗略：小於 1911 視為民國年
+    if year < 1911:
+        year = year + 1911
 
+    month = int(m)
+    day = int(d)
 
-# -------------------------
-# 舊 ASP.NET ViewState（你的程式碼原封保留）
-# -------------------------
-def extract_viewstate_fields(soup):
-    def val(name):
-        el = soup.find("input", {"name": name})
-        return el["value"] if el and el.has_attr("value") else ""
-    return {
-        "__VIEWSTATE": val("__VIEWSTATE"),
-        "__VIEWSTATEGENERATOR": val("__VIEWSTATEGENERATOR"),
-        "__EVENTVALIDATION": val("__EVENTVALIDATION"),
-    }
+    dt = datetime(year, month, day)
+    return dt.strftime("%Y-%m-%d")
 
 
-def extract_postback_target(a_tag):
-    m = re.search(r"__doPostBack\('([^']+)'", a_tag.get("href", ""))
-    return m.group(1) if m else None
+def normalize_date_column(df: pd.DataFrame, col: str) -> pd.DataFrame:
+    """
+    把 df[col] 全部轉成 YYYY-MM-DD（字串），回傳新 DataFrame
+    """
+    if col not in df.columns:
+        raise KeyError(f"DataFrame 不含欄位 {col!r}")
+    df = df.copy()
+    df[col] = df[col].astype(str).apply(normalize_date_to_iso)
+    return df
 
 
-# -------------------------
-# 解析列表頁（你的版本，100%照搬）
-# -------------------------
-def parse_list_page(html):
+# ------------------------------------------------------------
+# GET with retry
+# ------------------------------------------------------------
+def safe_get(url: str, retries: int = 3, timeout: int = 20) -> str | None:
+    for i in range(1, retries + 1):
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=timeout)
+            r.raise_for_status()
+            r.encoding = r.apparent_encoding
+            return r.text
+        except Exception as e:
+            print(f"⚠️ 第 {i} 次失敗：{url} - {e}")
+            time.sleep(1)
+    print(f"❌ 最終失敗：{url}")
+    return None
+
+
+# ------------------------------------------------------------
+# 列表頁
+# ------------------------------------------------------------
+def build_list_url(page: int) -> str:
+    # page=1: /plaactlist, page>=2: /plaactlist/2
+    return LIST_BASE if page == 1 else f"{LIST_BASE}/{page}"
+
+
+def crawl_list_page(page: int) -> List[Dict]:
+    """
+    抓某一頁列表，只留你指定關鍵字的公告
+    回傳 list[dict]:
+        {
+            "roc_date": "114.12.01",
+            "url": "https://www.mnd.gov.tw/......",
+            "title": "114.12.01中共解放軍臺海周邊海、空域動態......"
+        }
+    """
+    url = build_list_url(page)
+    print(f"\n🔍 抓列表頁：{url}")
+
+    html = safe_get(url)
+    if html is None:
+        print("⚠️ 列表頁抓取失敗，視為無資料")
+        return []
+
     soup = BeautifulSoup(html, "html.parser")
-    fields = extract_viewstate_fields(soup)
-    items = []
+    rows: List[Dict] = []
 
-    KEYWORDS = [
-        "中共解放軍臺海周邊海、空域動態",
-        "中共解放軍軍機",
-        "中共解放軍進入我西南空域活動情況",
-        "踰越海峽中線",
-        "逾越海峽中線",
-        "我西南空域空情動態",
-        "臺海周邊空域空情動態",
-        "偵獲共機、艦在臺海周邊活動情形",
-    ]
-
-    for tr in soup.select("table tr"):
-        a = tr.find("a", href=True)
-        if not a:
+    for a in soup.find_all("a", href=True):
+        title = a.get_text(strip=True)
+        if not title:
             continue
 
-        title = a.get_text(strip=True)
+        # 關鍵字過濾
         if not any(kw in title for kw in KEYWORDS):
             continue
 
-        target = extract_postback_target(a)
-
-        date_text = ""
-        for td in tr.find_all("td"):
-            if re.search(r"\d{3}[./]\d{1,2}[./]\d{1,2}", td.get_text()):
-                date_text = td.get_text(strip=True)
-                break
-
-        items.append({"date": date_text, "target": target, "view": fields})
-
-    return items
-
-
-# -------------------------
-# 內頁 AJAX PostBack（你的版本，照搬）
-# -------------------------
-def fetch_detail(session, view_fields, target):
-    data = {
-        "__EVENTTARGET": target,
-        "__EVENTARGUMENT": "",
-        "__VIEWSTATE": view_fields["__VIEWSTATE"],
-        "__VIEWSTATEGENERATOR": view_fields["__VIEWSTATEGENERATOR"],
-        "__EVENTVALIDATION": view_fields["__EVENTVALIDATION"],
-    }
-
-    for _ in range(3):
-        try:
-            r = session.post(BASE_URL, headers=HEADERS, data=data, timeout=40)
-            r.raise_for_status()
-            return r.text
-        except Exception:
-            time.sleep(2)
-
-    return ""
-
-
-# -------------------------
-# 抽取內文（你的版本）
-# -------------------------
-def extract_clean_paragraph(html):
-    soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text(" ", strip=True)
-
-    PREFIX_LIST = [
-        "中共解放軍臺海周邊海、空域動態",
-        "中共解放軍軍機",
-        "中共解放軍進入我西南空域活動情況",
-        "踰越海峽中線",
-        "逾越海峽中線",
-        "我西南空域空情動態",
-        "臺海周邊空域空情動態",
-        "偵獲共機、艦在臺海周邊活動情形",
-    ]
-
-    start = min([text.find(p) for p in PREFIX_LIST if p in text] or [-1])
-    if start == -1:
-        return text
-
-    # 停在「國軍運用任務機、艦及岸置飛彈系統嚴密監控與應處。」
-    end_candidates = []
-    END_PHRASES = [
-        "國軍運用任務機、艦及岸置飛彈系統嚴密監控與應處。",
-        "國軍運用任務機、艦及岸置飛彈系統嚴密監控與應處",
-    ]
-
-    for ph in END_PHRASES:
-        pos = text.find(ph, start)
-        if pos != -1:
-            end_candidates.append(pos + len(ph))
-
-    end = min(end_candidates) if end_candidates else len(text)
-    seg = text[start:end]
-    return seg.replace("\n", " ").replace("\r", " ").strip()
-
-
-# -------------------------
-# 使用你的爬法往下翻頁（直到真的沒資料）
-# -------------------------
-def crawl_all():
-    session = requests.Session()
-    page = 1
-    records = []
-
-    while True:
-        url = f"{BASE_URL}&Page={page}"
-        print(f"📄 抓取第 {page} 頁...")
-
-        try:
-            r = session.get(url, headers=HEADERS, timeout=40)
-        except:
-            print("逾時，再試一次...")
-            time.sleep(2)
+        # 例如：114.12.01中共解放軍臺海周邊海、空域動態點閱次數：413 次
+        m = re.search(r"\d{3}\.\d{2}\.\d{2}", title)
+        if not m:
             continue
+        roc_date = m.group(0)
 
-        items = parse_list_page(r.text)
+        article_url = requests.compat.urljoin(BASE_URL, a["href"])
+        rows.append({"roc_date": roc_date, "url": article_url, "title": title})
 
-        if not items:
-            print(f"🔥 第 {page} 頁抓不到資料 → 視為最後一頁，停止")
-            break
-
-        for it in items:
-            html_detail = fetch_detail(session, it["view"], it["target"])
-            clean_text = extract_clean_paragraph(html_detail)
-            date_norm = normalize_date(it["date"])
-
-            records.append({
-                "日期": date_norm,
-                "標題": "中共解放軍臺海周邊海、空域動態",
-                "內容": clean_text,
-                "來源網址": BASE_URL,
-            })
-
-            time.sleep(0.6)
-
-        page += 1
-
-    return pd.DataFrame(records)
+    print(f"📌 本頁抓到 {len(rows)} 筆")
+    return rows
 
 
-# -------------------------
-# 補丁功能（覆蓋同一天）
-# -------------------------
-def load_manual_gap():
+# ------------------------------------------------------------
+# 內頁：只抓 maincontent
+# ------------------------------------------------------------
+def extract_maincontent_text(html: str) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+    main = soup.select_one("div.maincontent")
+    if not main:
+        return ""
+    text = " ".join(main.stripped_strings)
+    return text
+
+
+def crawl_article(url: str) -> str:
+    print(f"➡️ 抓文章頁：{url}")
+    html = safe_get(url)
+    if html is None:
+        return ""
+    return extract_maincontent_text(html)
+
+
+# ------------------------------------------------------------
+# 合併補丁 manual_gap.csv（以西元日期為 key 覆蓋）
+# ------------------------------------------------------------
+def load_manual_gap() -> pd.DataFrame | None:
+    """
+    manual_gap.csv 結構（最少）：
+    日期,內容
+    2025/02/03,國防部今日表示，……
+    
+    可選欄位：
+    - 標題
+    - 來源網址
+
+    日期可以是：
+    - 2025/2/3, 2025-02-03
+    - 114/2/3, 114年2月3日, 114.02.03（會轉成西元）
+
+    回傳的 DataFrame：
+    - 日期 已轉為 YYYY-MM-DD
+    - 至少含有：日期, 標題, 內容, 來源網址
+    """
     if not MANUAL_GAP.exists():
+        print("ℹ️ 找不到 manual_gap.csv，略過補丁讀取")
         return None
 
-    df = pd.read_csv(MANUAL_GAP)
+    print(f"📥 讀取補丁：{MANUAL_GAP}")
+    gap = pd.read_csv(MANUAL_GAP, encoding="utf-8-sig")
 
-    if "日期" not in df.columns or "內容" not in df.columns:
-        raise ValueError("manual_gap.csv 必須有『日期』『內容』兩欄")
+    if "日期" not in gap.columns or "內容" not in gap.columns:
+        raise KeyError("manual_gap.csv 至少要有『日期』『內容』兩個欄位。")
 
-    df["日期"] = df["日期"].apply(normalize_date)
+    # 統一日期格式
+    gap = normalize_date_column(gap, "日期")
 
-    if "標題" not in df.columns:
-        df["標題"] = "中共解放軍臺海周邊海、空域動態"
-    if "來源網址" not in df.columns:
-        df["來源網址"] = ""
+    # 補缺欄位
+    if "標題" not in gap.columns:
+        gap["標題"] = "中共解放軍臺海周邊海、空域動態"
+    if "來源網址" not in gap.columns:
+        gap["來源網址"] = ""
 
-    return df[["日期", "標題", "內容", "來源網址"]]
+    # 欄位順序整理
+    gap = gap[["日期", "標題", "內容", "來源網址"]]
 
-
-def apply_gap(df, gap):
-    if gap is None:
-        return df
-
-    df = df.copy()
-    gap_dates = gap["日期"].unique().tolist()
-
-    df = df[~df["日期"].isin(gap_dates)]
-    merged = pd.concat([df, gap], ignore_index=True)
-
-    return merged.sort_values("日期", ascending=False).reset_index(drop=True)
+    print(f"📥 補丁筆數：{len(gap)}")
+    return gap
 
 
-# -------------------------
-# main
-# -------------------------
-def main():
-    print("🚀 開始爬取資料")
-    df = crawl_all()
+def apply_manual_gap(base_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    以「日期」（YYYY-MM-DD）為 key 套用補丁：
 
-    print(f"✔ 爬到共 {len(df)} 筆")
+    規則：
+    1. 若 manual_gap.csv 不存在 → 直接回傳 base_df
+    2. 若存在：
+       - 讀出 gap_df，日期轉成 YYYY-MM-DD
+       - 刪除 base_df 中所有「日期在 gap_df 裡」的列
+       - 再把 gap_df 加進來
+       - 依日期排序後回傳
+    """
+    gap_df = load_manual_gap()
+    if gap_df is None or gap_df.empty:
+        print("ℹ️ 沒有補丁或補丁為空，略過補丁合併")
+        # 仍然確保欄位齊全
+        base_df = base_df.copy()
+        for col in ["日期", "標題", "內容", "來源網址"]:
+            if col not in base_df.columns:
+                base_df[col] = ""
+        base_df = base_df[["日期", "標題", "內容", "來源網址"]]
+        # 日期已在外面處理成 YYYY-MM-DD，這裡只做排序
+        base_df = base_df.sort_values("日期").reset_index(drop=True)
+        return base_df
 
-    gap = load_manual_gap()
-    if gap is not None:
-        print(f"✔ 載入補丁 {len(gap)} 筆")
+    base_df = base_df.copy()
 
-    final = apply_gap(df, gap)
+    # 確保欄位一致
+    for col in ["日期", "標題", "內容", "來源網址"]:
+        if col not in base_df.columns:
+            base_df[col] = ""
 
-    print(f"✔ 套用補丁後共 {len(final)} 筆")
+    base_df = base_df[["日期", "標題", "內容", "來源網址"]]
+    gap_df = gap_df[["日期", "標題", "內容", "來源網址"]]
 
-    # 實際 CSV（無引號，整段文字不換行）
-    final.to_csv(
-        OUTPUT_CSV,
-        index=False,
-        encoding="utf-8-sig",
-        quoting=3  # csv.QUOTE_NONE
+    # 以日期為 key 覆蓋：先刪再加
+    gap_dates = gap_df["日期"].unique().tolist()
+    before_len = len(base_df)
+    base_df = base_df[~base_df["日期"].isin(gap_dates)].reset_index(drop=True)
+    after_len = len(base_df)
+    print(f"🩹 套用補丁：刪除原本同日期資料 {before_len - after_len} 筆")
+
+    merged_df = pd.concat([base_df, gap_df], ignore_index=True)
+
+    # 依日期排序（YYYY-MM-DD 字串可以直接正確排序）
+    merged_df = merged_df.sort_values("日期").reset_index(drop=True)
+    print(f"🩹 套用補丁後總筆數：{len(merged_df)}")
+    return merged_df
+
+
+# ------------------------------------------------------------
+# full：抓到「沒有新文章」就自動停
+# ------------------------------------------------------------
+def run_full():
+    print("🚀 [FULL] 全量模式開始")
+
+    all_rows: List[Dict] = []
+    seen_urls: set[str] = set()
+    page = 1
+    consecutive_no_new = 0  # 連續幾頁「沒有新文章」
+
+    while True:
+        entries = crawl_list_page(page)
+        if not entries:
+            print("⚪ 此頁完全沒有符合關鍵字的文章 → 視為尾端，停止。")
+            break
+
+        # 只留下沒看過的 url
+        new_entries = [e for e in entries if e["url"] not in seen_urls]
+
+        if not new_entries:
+            consecutive_no_new += 1
+            print(f"⚪ 第 {page} 頁沒有新文章（連續 {consecutive_no_new} 頁）。")
+
+            # 國防部在超過最後一頁時會重複回傳同一頁
+            # → 連續兩頁都沒有新網址，就視為已經刷到最後一頁
+            if consecutive_no_new >= 2:
+                print("🔚 連續兩頁都沒有新網址，判定已到最後一頁，停止往後抓。")
+                break
+        else:
+            consecutive_no_new = 0
+
+        for e in new_entries:
+            seen_urls.add(e["url"])
+            content = crawl_article(e["url"])
+
+            # 轉日期：114.12.01 → 114/12/01 → 2025-12-01
+            roc_date_slash = e["roc_date"].replace(".", "/")
+            iso_date = normalize_date_to_iso(roc_date_slash)
+
+            all_rows.append(
+                {
+                    "日期": iso_date,
+                    "標題": e["title"],
+                    "內容": content,
+                    "來源網址": e["url"],
+                }
+            )
+            time.sleep(0.3)
+
+        print(f"📊 累積筆數：{len(all_rows)}")
+        page += 1
+        time.sleep(0.5)
+
+        # 安全保險：防禦性上限，避免意外 infinite loop
+        if page > 1000:
+            print("⚠️ 頁數超過 1000，強制停止（應該不會發生）。")
+            break
+
+    df = pd.DataFrame(all_rows)
+
+    if df.empty:
+        print("⚠️ 全量爬完結果為空，請檢查列表 selector 或網站結構。")
+        # 建一個空的標準欄位 CSV，至少不會直接炸掉
+        df = pd.DataFrame(columns=["日期", "標題", "內容", "來源網址"])
+        df.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
+        print(f"⚠️ 輸出空 CSV：{OUTPUT_CSV}")
+        return
+
+    # 日期已經是 ISO，這裡主要是套補丁＋排序
+    df = apply_manual_gap(df)
+    df.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
+
+    print(f"✅ 全量完成，輸出 {OUTPUT_CSV}，共 {len(df)} 筆")
+
+
+# ------------------------------------------------------------
+# daily：每天只抓最新一筆
+# ------------------------------------------------------------
+def run_daily():
+    print("📅 [DAILY] 每日模式開始（只抓最新一筆）")
+
+    entries = crawl_list_page(1)
+    if not entries:
+        print("⚠️ 第 1 頁抓不到資料，今日略過。")
+        return
+
+    newest = entries[0]
+
+    roc_date_slash = newest["roc_date"].replace(".", "/")
+    iso_date = normalize_date_to_iso(roc_date_slash)
+    content = crawl_article(newest["url"])
+
+    df_new = pd.DataFrame(
+        [
+            {
+                "日期": iso_date,
+                "標題": newest["title"],
+                "內容": content,
+                "來源網址": newest["url"],
+            }
+        ]
     )
 
-    print(f"🎉 已輸出 CSV → {OUTPUT_CSV}")
+    if OUTPUT_CSV.exists():
+        df_old = pd.read_csv(OUTPUT_CSV, encoding="utf-8-sig")
+        # 舊檔如果還是舊格式（只有日期＋內容、民國日期），這裡會稍微「幫你升級」：
+        if "標題" not in df_old.columns:
+            df_old["標題"] = ""
+        if "來源網址" not in df_old.columns:
+            df_old["來源網址"] = ""
+        if df_old["日期"].astype(str).str.contains(r"/").any():
+            # 粗略判斷舊檔可能是民國格式（例如 114/02/03）
+            try:
+                df_old = normalize_date_column(df_old, "日期")
+            except Exception as e:
+                print(f"⚠️ 舊檔日期轉換失敗：{e}")
+        df = pd.concat([df_old, df_new], ignore_index=True)
+    else:
+        df = df_new
+
+    df = apply_manual_gap(df)
+    df.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
+
+    print(f"✅ 每日更新完成，現在 {OUTPUT_CSV} 共 {len(df)} 筆")
 
 
+# ------------------------------------------------------------
+# main
+# ------------------------------------------------------------
 if __name__ == "__main__":
-    main()
+    # python mnd_crawler.py full  → 全量
+    # python mnd_crawler.py       → 每日模式
+    if len(sys.argv) > 1 and sys.argv[1] == "full":
+        run_full()
+    else:
+        run_daily()
