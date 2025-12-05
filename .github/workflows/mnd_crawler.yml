@@ -1,69 +1,71 @@
 name: MND PLA Crawler
 
 on:
+  # 每天台灣時間 14:00（UTC+8）執行 → 換算為 06:00 UTC
   schedule:
-    # 台灣下午 2 點 = UTC 06:00
-    - cron: "0 6 * * *"
+    - cron: '0 6 * * *'
+
+  # 手動觸發，可以選 full / daily
   workflow_dispatch:
     inputs:
       mode:
-        description: "執行模式：full=全量；daily=每日更新"
+        description: '執行模式：full = 全量重建；daily = 每日增量'
         required: true
-        default: "daily"
+        default: 'daily'
         type: choice
         options:
           - daily
           - full
-  push:
-    branches:
-      - main
 
 jobs:
   run-crawler:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install requests beautifulsoup4 lxml pandas
 
-      - name: Run crawler (daily / full)
+      - name: Run crawler (full / daily)
         run: |
-          echo "Event: ${{ github.event_name }}"
-          echo "Mode:  ${{ github.event.inputs.mode }}"
-
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && \
-             [ "${{ github.event.inputs.mode }}" = "full" ]; then
-              echo "▶ 手動 FULL"
-              python mnd_crawler.py full
-          elif [ "${{ github.event_name }}" = "schedule" ]; then
-              echo "▶ 自動 DAILY"
-              python mnd_crawler.py
+          echo "event_name = ${{ github.event_name }}"
+          echo "mode input = ${{ github.event.inputs.mode }}"
+          
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.mode }}" = "full" ]; then
+            echo "▶ 手動觸發：FULL 全量模式"
+            python mnd_crawler.py full
           else
-              echo "▶ PUSH → DAILY"
-              python mnd_crawler.py
+            echo "▶ 預設：DAILY 每日模式"
+            python mnd_crawler.py
           fi
 
-      - name: Commit & Push if changed
+      - name: Commit and push if data changed
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if git diff --quiet; then
-            echo "No changes."
-            exit 0
-          fi
+          ls -al
+          git status
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # 先把可能更新的檔案加入暫存
           git add mnd_pla.csv manual_gap.csv || true
-          git commit -m "Update MND PLA data [skip ci]"
+
+          # 檢查 staging 區是否真的有變化（包括新檔案）
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Update MND PLA data"
           git push
