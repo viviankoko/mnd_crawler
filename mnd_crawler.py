@@ -128,18 +128,52 @@ def normalize_date_column(df: pd.DataFrame, col: str) -> pd.DataFrame:
 # GET with retry
 # ------------------------------------------------------------
 def safe_get(url: str, retries: int = 3, timeout: int = 20) -> str | None:
+    """
+    發 GET，回傳正確解碼後的文字（優先嘗試 utf-8 / big5 / cp950），
+    避免少數舊頁面（例如 109.09.17）出現亂碼。
+    """
     for i in range(1, retries + 1):
         try:
             r = requests.get(url, headers=HEADERS, timeout=timeout)
             r.raise_for_status()
-            r.encoding = r.apparent_encoding
-            return r.text
+
+            raw = r.content  # 先拿 bytes
+
+            # 優先放進可能的編碼
+            enc_candidates: list[str] = []
+
+            if r.encoding:
+                enc_candidates.append(r.encoding)
+            if r.apparent_encoding and r.apparent_encoding not in enc_candidates:
+                enc_candidates.append(r.apparent_encoding)
+
+            # 再補常見的
+            for e in ("utf-8", "big5", "cp950"):
+                if e not in enc_candidates:
+                    enc_candidates.append(e)
+
+            text = None
+            for enc in enc_candidates:
+                try:
+                    text = raw.decode(enc)
+                    # print(f"[DEBUG] {url} 使用編碼：{enc}")
+                    break
+                except UnicodeDecodeError:
+                    continue
+
+            if text is None:
+                # 全部失敗就用 utf-8 + replace 撐住
+                text = raw.decode("utf-8", errors="replace")
+                # print(f"[DEBUG] {url} 使用編碼：utf-8 (replace)")
+
+            return text
+
         except Exception as e:
             print(f"⚠️ 第 {i} 次失敗：{url} - {e}")
             time.sleep(1)
+
     print(f"❌ 最終失敗：{url}")
     return None
-
 
 # ------------------------------------------------------------
 # 列表頁
@@ -373,17 +407,22 @@ def run_full():
     if df.empty:
         print("⚠️ 全量爬完結果為空，請檢查列表 selector 或網站結構。")
         # 建一個空的標準欄位 CSV，至少不會直接炸掉
-        df = pd.DataFrame(columns=["日期", "標題", "內容", "來源網址"])
+        df = pd.DataFrame(columns=["日期", "公告內容"])
         df.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
         print(f"⚠️ 輸出空 CSV：{OUTPUT_CSV}")
         return
 
-    # 日期已經是 ISO，這裡主要是套補丁＋排序
+    # 日期已經是 ISO，這裡主要是套補丁
     df = apply_manual_gap(df)
-    df.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
 
-    print(f"✅ 全量完成，輸出 {OUTPUT_CSV}，共 {len(df)} 筆")
+    # 只保留「日期」「內容」，並把「內容」改名成「公告內容」
+    output_df = df[["日期", "內容"]].rename(columns={"內容": "公告內容"})
 
+    # 日期由近到遠排序（新到舊）
+    output_df = output_df.sort_values("日期", ascending=False).reset_index(drop=True)
+
+    output_df.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
+    print(f"✅ 全量完成，輸出 {OUTPUT_CSV}，共 {len(output_df)} 筆")
 
 # ------------------------------------------------------------
 # daily：每天只抓最新一筆
@@ -415,6 +454,11 @@ def run_daily():
 
     if OUTPUT_CSV.exists():
         df_old = pd.read_csv(OUTPUT_CSV, encoding="utf-8-sig")
+
+        # 如果舊檔是「日期, 公告內容」的格式，先映射回「內容」
+        if "內容" not in df_old.columns and "公告內容" in df_old.columns:
+            df_old["內容"] = df_old["公告內容"]
+
         # 舊檔如果還是舊格式（只有日期＋內容、民國日期），這裡會稍微「幫你升級」：
         if "標題" not in df_old.columns:
             df_old["標題"] = ""
@@ -426,15 +470,24 @@ def run_daily():
                 df_old = normalize_date_column(df_old, "日期")
             except Exception as e:
                 print(f"⚠️ 舊檔日期轉換失敗：{e}")
+
         df = pd.concat([df_old, df_new], ignore_index=True)
+
     else:
         df = df_new
 
+    # 不管有沒有舊檔，都要在這裡套一次補丁
     df = apply_manual_gap(df)
-    df.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
 
-    print(f"✅ 每日更新完成，現在 {OUTPUT_CSV} 共 {len(df)} 筆")
+    # 只保留「日期」「內容」，並把「內容」改名成「公告內容」
+    output_df = df[["日期", "內容"]].rename(columns={"內容": "公告內容"})
 
+    # 日期由近到遠排序（新到舊）
+    output_df = output_df.sort_values("日期", ascending=False).reset_index(drop=True)
+
+    output_df.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
+
+    print(f"✅ 每日更新完成，現在 {OUTPUT_CSV} 共 {len(output_df)} 筆")
 
 # ------------------------------------------------------------
 # main
