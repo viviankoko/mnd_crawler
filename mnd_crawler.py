@@ -229,14 +229,44 @@ def crawl_list_page(page: int) -> List[Dict]:
 # ------------------------------------------------------------
 # 內頁：只抓 maincontent
 # ------------------------------------------------------------
+def clean_content(text: str) -> str:
+    """把公告內容裡的換行、全形空白等整理成單行字串。"""
+    if not isinstance(text, str):
+        return ""
+
+    # 統一換行符號
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    # 先處理「換行 + 全形空白」這種很常見的段落開頭
+    # 例如："...應處。\n　此外，國防部指出..." → "...應處。此外，國防部指出..."
+    text = text.replace("\n\u3000", "")
+
+    # 其餘換行一律改成空白，避免 CSV 斷行
+    text = text.replace("\n", " ")
+
+    # 把連續空白（含 tab）縮成一個半形空白
+    text = re.sub(r"\s+", " ", text)
+
+    # 把全形空白（\u3000）也拿掉或改成半形空白，你可以二選一：
+    # 完全拿掉：
+    text = text.replace("\u3000", "")
+    # 如果你想保留成半形空白，就改成：
+    # text = text.replace("\u3000", " ")
+
+    return text.strip()
+
 def extract_maincontent_text(html: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
     main = soup.select_one("div.maincontent")
     if not main:
         return ""
+    # 原本就有的：把各段文字用空白串起來
     text = " ".join(main.stripped_strings)
-    return text
 
+    # ✅ 新增這行：統一清掉不必要的換行／空白
+    text = clean_content(text)
+
+    return text
 
 def crawl_article(url: str) -> str:
     print(f"➡️ 抓文章頁：{url}")
