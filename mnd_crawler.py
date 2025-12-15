@@ -574,8 +574,11 @@ wrangled_data = pd.DataFrame({
 })
 
 # 顯示整理後的資料
-display(wrangled_data)
+print(wrangled_data)
 
 output_csv_filename = "mnd_pla_wrangled.csv"
 wrangled_data = wrangled_data.sort_values("日期", ascending=False).reset_index(drop=True)
+
+# 輸出 CSV
 wrangled_data.to_csv(output_csv_filename, index=False, encoding="utf-8-sig")
+print(f"✅ 已輸出整理後的資料：{output_csv_filename}，共 {len(wrangled_data)} 筆")
