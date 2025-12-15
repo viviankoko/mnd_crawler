@@ -59,7 +59,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
           # 先把可能更新的檔案加入暫存
-          git add mnd_pla.csv manual_gap.csv || true
+          git add mnd_pla.csv manual_gap.csv mnd_pla_wrangled.csv || true
 
           # 檢查 staging 區是否真的有變化（包括新檔案）
           if git diff --cached --quiet; then
@@ -69,3 +69,56 @@ jobs:
 
           git commit -m "Update MND PLA data"
           git push
+
+      - name: Data Cleaning - Clean and wrangle data
+        run: |
+          python -c "
+import re
+import pandas as pd
+
+# 讀取原始資料
+path_to_csv = 'mnd_pla.csv'
+raw_data = pd.read_csv(path_to_csv)
+
+n_airplanes = []
+n_warships = []
+n_aidz_airplanes = []
+
+# 從 '公告內容' 欄位提取相關數據
+for content in raw_data['公告內容']:
+    # 提取 共機架次
+    xs_airplanes = re.findall(r'共機(\\d+)', content)
+    if len(xs_airplanes) > 0:
+        n_airplanes.append(int(xs_airplanes[0]))
+    else:
+        n_airplanes.append(0)
+
+    # 提取 共艦架次
+    xs_warships = re.findall(r'共艦(\\d+)', content)
+    if len(xs_warships) > 0:
+        n_warships.append(int(xs_warships[0]))
+    else:
+        n_warships.append(0)
+
+    # 提取 進入AIDZ共機架次
+    xs_aidz_combined = re.findall(r'(?:空域計|空域)(\\d+)', content)
+    if len(xs_aidz_combined) > 0:
+            n_aidz_airplanes.append(int(xs_aidz_combined[0]))
+    else:
+        n_aidz_airplanes.append(0)
+
+# 建立整理後的 DataFrame，包含日期、共機架次、共艦架次、進入AIDZ共機架次
+wrangled_data = pd.DataFrame({
+    '日期': raw_data['日期'],
+    '共機架次': n_airplanes,
+    '共艦架次': n_warships,
+    '進入AIDZ共機架次': n_aidz_airplanes
+})
+
+# 排序並輸出整理後的 CSV
+output_csv_filename = 'mnd_pla_wrangled.csv'
+wrangled_data = wrangled_data.sort_values('日期', ascending=False).reset_index(drop=True)
+wrangled_data.to_csv(output_csv_filename, index=False, encoding='utf-8-sig')
+
+print(f'✅ 已輸出整理後的資料：{output_csv_filename}，共 {len(wrangled_data)} 筆')
+          "
