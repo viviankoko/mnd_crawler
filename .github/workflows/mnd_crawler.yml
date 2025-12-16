@@ -62,47 +62,72 @@ jobs:
               print(f"❌ 找不到檔案: {path_to_csv}，跳過資料整理。")
               sys.exit(0)
 
+          # 創造空清單
           n_airplanes = []
           n_warships = []
           n_aidz_airplanes = []
 
-          # 使用 fillna('') 來避免 None/NaN 導致 re.findall 拋例外
+          # 使用 fillna('') 將 None 或 NaN 替換為空字符串（''），確保 re.findall 不會因為這些缺失值而拋出錯誤
           for content in raw_data["公告內容"].fillna(""):
-              # Extract 共機架次
+              # Extract 共機架次（尋找共機後的整數）
               xs_airplanes = re.findall(r"共機(\d+)", content)
               if len(xs_airplanes) > 0:
                   n_airplanes.append(int(xs_airplanes[0]))
               else:
-                  n_airplanes.append(0)
+                  # 備援：若沒有「共機(\d+)」這種格式，嘗試從「機型 / Aircraft Type」區段抓取所有「數字 + 架次」並相加
+                  section = content
+                  for kw in ["機型", "Aircraft Type"]:
+                      if kw in content:
+                          section = content.split(kw, 1)[1]
+                          break
 
-              # Extract 共艦架次
+                  nums = re.findall(r"(\d+)\s*(?=架次)", section)
+                  if nums:
+                      n_airplanes.append(sum(int(x) for x in nums))
+                  else:
+                      n_airplanes.append(0)
+
+              # Extract 共艦架次（尋找共艦後的整數，2022/8/5前的資料未提及共艦，故無設計備援方案）
               xs_warships = re.findall(r"共艦(\d+)", content)
               if len(xs_warships) > 0:
                   n_warships.append(int(xs_warships[0]))
               else:
                   n_warships.append(0)
 
-              # Extract 進入AIDZ共機架次
-              xs_aidz_combined = re.findall(r"(?:空域計|空域)(\d+)", content) # 包含 "空域計" 以及 "空域"兩種表達方式
+              # Extract 進入AIDZ共機架次（尋找空域或空域計後的整數）
+              xs_aidz_combined = re.findall(r"(?:空域計|空域)(\d+)", content)
               if len(xs_aidz_combined) > 0:
-                      n_aidz_airplanes.append(int(xs_aidz_combined[0]))
+                  n_aidz_airplanes.append(int(xs_aidz_combined[0]))
               else:
-                  n_aidz_airplanes.append(0)
+                  # 備援：若沒有直接的「空域計/空域(\d+)」格式，改從機型區段抓取所有「數字 + 架次」並相加
+                  section_a = content
+                  for kw in ["機型", "Aircraft Type"]:
+                      if kw in content:
+                          section_a = content.split(kw, 1)[1]
+                          break
+
+                  nums_a = re.findall(r"(\d+)\s*(?=架次)", section_a)
+                  if nums_a:
+                      n_aidz_airplanes.append(sum(int(x) for x in nums_a))
+                  else:
+                      n_aidz_airplanes.append(0)
 
           # 建立整理後的 DataFrame，包含日期、共機架次、共艦架次、進入AIDZ共機架次
           wrangled_data = pd.DataFrame({
-              '日期': raw_data['日期'],
+              '日期': raw_data.get('日期'),
               '共機架次': n_airplanes,
               '共艦架次': n_warships,
               '進入AIDZ共機架次': n_aidz_airplanes
           })
 
-          # 排序並輸出整理後的 CSV
-          output_csv_filename = 'mnd_pla_wrangled.csv'
+          # 把日期欄位轉為 datetime，以便正確排序；若失敗則用原始值排序
           try:
+              wrangled_data['日期'] = pd.to_datetime(wrangled_data['日期'])
               wrangled_data = wrangled_data.sort_values('日期', ascending=False).reset_index(drop=True)
           except Exception:
-              pass
+              wrangled_data = wrangled_data.sort_values('日期', ascending=False, na_position='last').reset_index(drop=True)
+
+          output_csv_filename = 'mnd_pla_wrangled.csv'
           wrangled_data.to_csv(output_csv_filename, index=False, encoding='utf-8-sig')
 
           print(f'✅ 已輸出整理後的資料：{output_csv_filename}，共 {len(wrangled_data)} 筆')
@@ -118,7 +143,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # 先把可能更新的檔案加入暫存
+          # 先把可能更新的檔案加入暫存（包含 wrangled 檔）
           git add mnd_pla.csv manual_gap.csv mnd_pla_wrangled.csv || true
 
           # 檢查 staging 區是否真的有變化（包括新檔案）
