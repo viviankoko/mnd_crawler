@@ -16,23 +16,7 @@ raw_data = pd.read_csv(path_to_csv)
 
 raw_data
 
-n_airplanes = []
-n_warships = []
 
-for content in raw_data["公告內容"]:
-    # Extract 共機架次
-    xs_airplanes = re.findall(r"共機(\d+)", content)
-    if len(xs_airplanes) > 0:
-        n_airplanes.append(int(xs_airplanes[0]))
-    else:
-        n_airplanes.append(0)
-
-    # Extract 共艦架次
-    xs_warships = re.findall(r"共艦(\d+)", content)
-    if len(xs_warships) > 0:
-        n_warships.append(int(xs_warships[0]))
-    else:
-        n_warships.append(0)
 
 n_airplanes = []
 n_warships = []
