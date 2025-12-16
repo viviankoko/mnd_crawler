@@ -66,51 +66,43 @@ jobs:
           n_warships = []
           n_aidz_airplanes = []
 
-          # 從 '公告內容' 欄位提取相關數據，並防止 NaN / 非字串造成錯誤
-          for content in raw_data.get('公告內容', []):
-              text = '' if pd.isna(content) else str(content)
+          # 使用 fillna('') 來避免 None/NaN 導致 re.findall 拋例外
+          for content in raw_data["公告內容"].fillna(""):
+              # Extract 共機架次
+              xs_airplanes = re.findall(r"共機(\d+)", content)
+              if len(xs_airplanes) > 0:
+                  n_airplanes.append(int(xs_airplanes[0]))
+              else:
+                  n_airplanes.append(0)
 
-              # 擴展 regex 以涵蓋不同表示法，並抓第一個數字
-              xs_airplanes = re.findall(r'共機(?:架次)?\D*(\d+)', text)
-              xs_warships = re.findall(r'共艦(?:架次)?\D*(\d+)', text)
-              xs_aidz = re.findall(r'(?:進入AIDZ|進入 AIDZ|空域計|空域)\D*(\d+)', text)
+              # Extract 共艦架次
+              xs_warships = re.findall(r"共艦(\d+)", content)
+              if len(xs_warships) > 0:
+                  n_warships.append(int(xs_warships[0]))
+              else:
+                  n_warships.append(0)
 
-              def first_int(xs):
-                  if xs:
-                      try:
-                          return int(xs[0])
-                      except Exception:
-                          return 0
-                  return 0
+              # Extract 進入AIDZ共機架次
+              xs_aidz_combined = re.findall(r"(?:空域計|空域)(\d+)", content) # 包含 "空域計" 以及 "空域"兩種表達方式
+              if len(xs_aidz_combined) > 0:
+                      n_aidz_airplanes.append(int(xs_aidz_combined[0]))
+              else:
+                  n_aidz_airplanes.append(0)
 
-              n_airplanes.append(first_int(xs_airplanes))
-              n_warships.append(first_int(xs_warships))
-              n_aidz_airplanes.append(first_int(xs_aidz))
-
-          # 保證長度與原始資料一致
-          L = len(raw_data)
-          def pad(lst):
-              return lst + [0] * (L - len(lst))
-
-          n_airplanes = pad(n_airplanes)
-          n_warships = pad(n_warships)
-          n_aidz_airplanes = pad(n_aidz_airplanes)
-
+          # 建立整理後的 DataFrame，包含日期、共機架次、共艦架次、進入AIDZ共機架次
           wrangled_data = pd.DataFrame({
-              '日期': raw_data.get('日期'),
+              '日期': raw_data['日期'],
               '共機架次': n_airplanes,
               '共艦架次': n_warships,
               '進入AIDZ共機架次': n_aidz_airplanes
           })
 
-          # 嘗試把日期欄位轉為 datetime，以便正確排序；若失敗則用原始值排序
+          # 排序並輸出整理後的 CSV
+          output_csv_filename = 'mnd_pla_wrangled.csv'
           try:
-              wrangled_data['日期'] = pd.to_datetime(wrangled_data['日期'])
               wrangled_data = wrangled_data.sort_values('日期', ascending=False).reset_index(drop=True)
           except Exception:
-              wrangled_data = wrangled_data.sort_values('日期', ascending=False, na_position='last').reset_index(drop=True)
-
-          output_csv_filename = 'mnd_pla_wrangled.csv'
+              pass
           wrangled_data.to_csv(output_csv_filename, index=False, encoding='utf-8-sig')
 
           print(f'✅ 已輸出整理後的資料：{output_csv_filename}，共 {len(wrangled_data)} 筆')
@@ -126,7 +118,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # 先把可能更新的檔案加入暫存（包含 wrangled 檔）
+          # 先把可能更新的檔案加入暫存
           git add mnd_pla.csv manual_gap.csv mnd_pla_wrangled.csv || true
 
           # 檢查 staging 區是否真的有變化（包括新檔案）
